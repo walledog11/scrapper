@@ -1,6 +1,24 @@
 # depop_scraper_lib.py
-import asyncio, random, time, urllib.parse
+import os, sys, subprocess, asyncio, random, time, urllib.parse
 from typing import List, Dict
+
+# ---------- Ensure Playwright Chromium exists in the runtime ----------
+def ensure_playwright_chromium():
+    """
+    Install Chromium (and deps) into the default cache path if missing.
+    Safe to call repeatedly; no-op when already installed.
+    """
+    # Streamlit Cloud expects this cache path
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.path.expanduser("~/.cache/ms-playwright"))
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        # If install fails, we'll still try to launch (may already be present)
+        pass
+
 
 # --------- Public API ---------
 def scrape_depop(term: str, deep: bool, limits: dict) -> List[Dict]:
@@ -8,7 +26,7 @@ def scrape_depop(term: str, deep: bool, limits: dict) -> List[Dict]:
     Sync wrapper. Tries real scrape with Playwright; falls back to sample rows if unavailable.
     """
     try:
-        from playwright.async_api import async_playwright  # noqa
+        from playwright.async_api import async_playwright  # noqa: F401
     except Exception:
         # Fallback so the app stays usable (helps verify Sheets wiring in cloud)
         return [
@@ -28,17 +46,29 @@ def scrape_depop(term: str, deep: bool, limits: dict) -> List[Dict]:
 
 # --------- Real scraper (lightweight) ---------
 async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]:
+    # Ensure Chromium is available in this container/session
+    ensure_playwright_chromium()
+
     from playwright.async_api import async_playwright
 
     base_url = f"https://www.depop.com/search/?q={urllib.parse.quote_plus(term)}"
     max_items = int(limits.get("MAX_ITEMS", 500))
     max_seconds = int(limits.get("MAX_DURATION_S", 600))
 
+    # Cloud-safe Chromium flags
+    launch_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-background-networking",
+    ]
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=launch_args)
         ctx = await browser.new_context(
-            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         )
         page = await ctx.new_page()
         await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
@@ -76,11 +106,13 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
                 price = ""
                 brand = ""
                 if li:
-                    ps = await page.evaluate("""el => Array.from(el.querySelectorAll('p')).map(n => n.textContent || '')""", li)
+                    ps = await page.evaluate(
+                        "el => Array.from(el.querySelectorAll('p')).map(n => n.textContent || '')", li
+                    )
                     # find something that looks like a currency
                     for t in ps:
-                        if any(sym in t for sym in ["$", "£", "€"]):
-                            price = t.strip()
+                        if any(sym in (t or "") for sym in ["$", "£", "€"]):
+                            price = (t or "").strip()
                     # last short non-price text as brand
                     for t in reversed(ps):
                         s = (t or "").strip()
