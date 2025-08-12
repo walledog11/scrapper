@@ -1,4 +1,3 @@
-# System libs for Playwright browsers on Streamlit Cloud
 ca-certificates
 fonts-liberation
 libasound2
