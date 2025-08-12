@@ -2,69 +2,12 @@
 import os, json
 import gspread
 
-# Streamlit is optional here (only used for the badge)
 try:
-    import streamlit as st
-except Exception:  # running outside Streamlit
-    st = None
+    import streamlit as st  # available on Cloud and when running `streamlit run`
+except Exception:
+    st = None  # allow import without Streamlit (e.g., plain scripts/tests)
 
-def _has_secrets():
-    """Return (has_table, has_json, is_cloud)."""
-    is_cloud = bool(os.environ.get("STREAMLIT_RUNTIME"))
-    has_table = False
-    has_json = False
-    if st is not None:
-        try:
-            has_table = "google_service_account" in st.secrets
-            has_json  = "GOOGLE_SERVICE_ACCOUNT" in st.secrets
-        except Exception:
-            pass
-    return has_table, has_json, is_cloud
-
-def authorize_gspread(prefer_local: bool = False) -> gspread.Client:
-    """
-    Cloud: prefer Streamlit Secrets ([google_service_account] or GOOGLE_SERVICE_ACCOUNT).
-    Local: if prefer_local=True, use credentials.json in project root.
-    Returns a gspread.Client or raises RuntimeError.
-    """
-    has_table, has_json, is_cloud = _has_secrets()
-
-    # Cloud-first when not preferring local
-    if not prefer_local and has_table and st is not None:
-        source = "[google_service_account] (TOML table)"
-        creds_dict = dict(st.secrets["google_service_account"])
-        client = gspread.service_account_from_dict(creds_dict)
-        _render_badge(ok=True, source=source)
-        return client
-
-    if not prefer_local and has_json and st is not None:
-        source = "GOOGLE_SERVICE_ACCOUNT (JSON string)"
-        creds_dict = json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
-        client = gspread.service_account_from_dict(creds_dict)
-        _render_badge(ok=True, source=source)
-        return client
-
-    # Local fallback
-    if os.path.exists("credentials.json"):
-        source = "credentials.json (local file)"
-        client = gspread.service_account(filename="credentials.json")
-        _render_badge(ok=True, source=source)
-        return client
-
-    # Nothing worked
-    _render_badge(
-        ok=False,
-        source="none",
-        note=("Add [google_service_account] to Secrets (TOML with triple-quoted private_key) "
-              "or place credentials.json next to app.py.")
-    )
-    raise RuntimeError(
-        "No Google credentials found. Add [google_service_account] or GOOGLE_SERVICE_ACCOUNT in Secrets, "
-        "or place credentials.json next to app.py"
-    )
-
-def _render_badge(ok: bool, source: str, note: str | None = None):
-    """Show a small badge in the UI (no-op outside Streamlit)."""
+def _badge(ok: bool, source: str, note: str | None = None):
     if st is None:
         return
     if ok:
@@ -73,3 +16,62 @@ def _render_badge(ok: bool, source: str, note: str | None = None):
         st.error("❌ No Google credentials detected")
         if note:
             st.caption(note)
+
+def authorize_gspread(prefer_local: bool = False) -> gspread.Client:
+    """
+    Priority:
+      - In Cloud: [google_service_account] table → GOOGLE_SERVICE_ACCOUNT JSON string → (no local)
+      - Locally (prefer_local=True): credentials.json → [google_service_account] → GOOGLE_SERVICE_ACCOUNT
+      - Locally (prefer_local=False): [google_service_account] → GOOGLE_SERVICE_ACCOUNT → credentials.json
+    Shows a badge indicating which source was used (when Streamlit is available).
+    """
+    IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
+
+    # Cloud forces secrets
+    if IS_CLOUD:
+        prefer_local = False
+
+    has_table = has_json = False
+    if st is not None:
+        try:
+            has_table = "google_service_account" in st.secrets
+            has_json  = "GOOGLE_SERVICE_ACCOUNT" in st.secrets
+        except Exception:
+            pass
+
+    order = ["table", "json", "local"]
+    if prefer_local:
+        order = ["local", "table", "json"]
+
+    # 1) TOML table: [google_service_account]
+    if "table" in order and has_table:
+        try:
+            creds_dict = dict(st.secrets["google_service_account"])
+            client = gspread.service_account_from_dict(creds_dict)
+            _badge(True, "[google_service_account] (TOML table)")
+            return client
+        except Exception as e:
+            if st: st.warning(f"Credential source 'table' failed: {e}")
+
+    # 2) JSON string: GOOGLE_SERVICE_ACCOUNT
+    if "json" in order and has_json:
+        try:
+            creds_dict = json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
+            client = gspread.service_account_from_dict(creds_dict)
+            _badge(True, "GOOGLE_SERVICE_ACCOUNT (JSON string)")
+            return client
+        except Exception as e:
+            if st: st.warning(f"Credential source 'json' failed: {e}")
+
+    # 3) Local file: credentials.json
+    if "local" in order and os.path.exists("credentials.json"):
+        try:
+            client = gspread.service_account(filename="credentials.json")
+            _badge(True, "credentials.json (local file)")
+            return client
+        except Exception as e:
+            if st: st.warning(f"Credential source 'local' failed: {e}")
+
+    _badge(False, "none", "Add [google_service_account] in Secrets (triple-quoted private_key) "
+                          "or set GOOGLE_SERVICE_ACCOUNT as a JSON string, or place credentials.json next to app.py.")
+    raise RuntimeError("No Google credentials found. Configure Secrets or add credentials.json.")

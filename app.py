@@ -1,4 +1,4 @@
-# app.py — streamlined, cloud-safe, with Secrets OK badge
+# app.py — streamlined header using creds_loader
 
 import os, sys, subprocess, datetime as _dt, streamlit as st
 
@@ -8,20 +8,17 @@ IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
 st.set_page_config(page_title="Depop Scraper", page_icon="🧢", layout="wide")
 st.title("🧢 Depop Scraper")
 
-# ---------------- Sidebar ----------------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("⚙️ Settings")
-
-    # Local dev toggle; forced OFF in cloud below
     prefer_local = st.toggle(
         "Prefer local credentials.json (dev)",
-        value=True,
-        help="Local dev uses credentials.json; Cloud uses Streamlit Secrets."
+        value=not IS_CLOUD,
+        help="Local dev can use credentials.json; Cloud forces Secrets."
     )
-
     if IS_CLOUD:
         prefer_local = False
-        st.caption("☁️ Cloud mode: using **Secrets** (credentials.json ignored)")
+        st.caption("☁️ Cloud mode: using **Secrets** (credentials.json ignored).")
 
     sheet_name = st.text_input("Google Sheet name", value="depop_scraper")
 
@@ -30,26 +27,14 @@ with st.sidebar:
     max_seconds = st.number_input("Max duration (seconds)", min_value=60, max_value=3600, value=900, step=30)
     deep_fetch = st.toggle("Deep fetch product pages (Size/Condition)", value=True)
 
-# ---------------- Help / Health ----------------
-with st.expander("🧩 First time? Setup help", expanded=False):
-    st.markdown(
-        "- **Local:** put `credentials.json` next to `app.py` (or use Secrets).\n"
-        "- **Streamlit Cloud:** add `[google_service_account]` under **Settings → Secrets**. "
-        "Use a *triple-quoted* `private_key` block.\n"
-        "- This app forces Secrets automatically in Cloud."
-    )
-
+# ---------- Health check (optional) ----------
 with st.expander("🔍 Health check", expanded=True):
     st.write("CWD:", os.getcwd())
-    try:
-        st.write("Files:", os.listdir())
-    except Exception as e:
-        st.write("Could not list files:", e)
-    try:
-        st.write("Secrets present? [google_service_account]:", "google_service_account" in st.secrets)
-    except Exception as e:
-        st.write("st.secrets not available:", e)
-    # Best-effort: ensure Chromium (no crash on failure)
+    try: st.write("Files:", os.listdir())
+    except Exception as e: st.write("Could not list files:", e)
+    try: st.write("Secrets present? [google_service_account]:", "google_service_account" in st.secrets)
+    except Exception as e: st.write("st.secrets not available:", e)
+    # Ensure Playwright Chromium (best-effort; won’t crash if fails)
     try:
         subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
@@ -59,24 +44,32 @@ with st.expander("🔍 Health check", expanded=True):
     except Exception as e:
         st.info(f"(Optional) Could not ensure Chromium: {e}")
 
-# ---------------- Main controls ----------------
+# ---------- Main controls ----------
 search_term = st.text_input("Search term", value="Supreme Box Logo")
 run = st.button("Run scrape 🚀", type="primary")
 
-# ---------------- Google Sheets auth (shows Secrets badge) ----------------
+# ---------- Google Sheets auth (badge shows which source was used) ----------
+from creds_loader import authorize_gspread
 gc = None
 try:
-    from creds_loader import authorize_gspread  # <- shows the 🔐 Secrets OK badge
     gc = authorize_gspread(prefer_local=prefer_local)
     try:
         st.caption("Service account: " + getattr(gc.auth, "service_account_email", "unknown"))
     except Exception:
         pass
 except Exception as e:
-    # Badge already showed the red error; keep this as extra detail
     st.warning(f"Sheets auth not ready (UI continues): {e}")
     if IS_CLOUD:
-        st.info("Cloud tip: ensure [google_service_account] is set in Settings → Secrets (private_key triple-quoted).")
+        st.info("Cloud tip: ensure **[google_service_account]** is set in Settings → Secrets (private_key triple-quoted).")
+
+# ---------- Your existing scrape handler below ----------
+# Example:
+# if run:
+#     from depop_scraper_lib import scrape_depop
+#     limits = dict(MAX_ITEMS=int(max_items), MAX_DURATION_S=int(max_seconds))
+#     rows = scrape_depop(search_term, deep=deep_fetch, limits=limits)
+#     ... save to Sheets using gc ...
+#     ... show st.dataframe ...
 
 # ---------------- Run scrape ----------------
 if run:
