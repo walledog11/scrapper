@@ -1,89 +1,81 @@
 # depop_scraper_lib.py
-import os, sys, subprocess, asyncio, random, time, urllib.parse, glob, shutil
+import os, sys, subprocess, asyncio, random, time, urllib.parse, glob
 from typing import List, Dict
 
 PLAYWRIGHT_CACHE = os.path.expanduser("~/.cache/ms-playwright")
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_CACHE)
 
-def _run(cmd: list[str], strict: bool, env: dict | None = None) -> tuple[int, str, str]:
-    p = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
-    )
-    out, err = p.communicate()
-    if strict and p.returncode != 0:
-        raise RuntimeError(f"Command failed {cmd}\nstdout:\n{out}\nstderr:\n{err}")
-    return p.returncode, out, err
+# ----------------- helpers -----------------
+def _run(cmd, note=""):
+    """Run a command; never raise. Return (rc, out, err)."""
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = p.communicate()
+        rc = p.returncode
+        if rc != 0:
+            print(f"[WARN] {note} rc={rc}\nstdout:\n{out[:2000]}\nstderr:\n{err[:2000]}")
+        else:
+            if out:
+                print(f"[INFO] {note} stdout:\n{out[:1000]}")
+        return rc, out, err
+    except Exception as e:
+        print(f"[WARN] {_short(cmd)} failed: {e}")
+        return 1, "", str(e)
 
-def _find_chromium_binary() -> str | None:
-    # Prefer headless_shell (Playwright 1.54+), fallback to chrome
-    patterns = [
-        os.path.join(PLAYWRIGHT_CACHE, "chromium_headless_shell-*", "chrome-linux", "headless_shell"),
-        os.path.join(PLAYWRIGHT_CACHE, "chromium-*", "chrome-linux", "chrome"),
-    ]
+def _short(cmd):
+    try:
+        return " ".join(cmd[:4]) + (" ..." if len(cmd) > 4 else "")
+    except:
+        return str(cmd)
+
+def _find_binary(engine: str) -> str | None:
+    """Locate a browser binary in the Playwright cache."""
+    patterns = []
+    if engine == "chromium":
+        patterns = [
+            os.path.join(PLAYWRIGHT_CACHE, "chromium_headless_shell-*", "chrome-linux", "headless_shell"),
+            os.path.join(PLAYWRIGHT_CACHE, "chromium-*", "chrome-linux", "chrome"),
+        ]
+    elif engine == "firefox":
+        patterns = [
+            os.path.join(PLAYWRIGHT_CACHE, "firefox-*", "firefox", "firefox"),
+        ]
     for pat in patterns:
-        matches = sorted(glob.glob(pat))
-        for m in matches:
+        for m in sorted(glob.glob(pat)):
             if os.path.isfile(m) and os.access(m, os.X_OK):
                 return m
     return None
 
-def ensure_playwright_chromium(verbose: bool = True) -> str:
+def ensure_browser(engine: str) -> str | None:
     """
-    Ensures Playwright's Chromium (headless_shell) is installed and returns the binary path.
-    Raises with a detailed message if we still can't find it.
+    Best-effort install for Playwright engines.
+    Returns executable path if found, else None.
+    Never raises on installer errors—just logs.
     """
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_CACHE)
-
-    # 0) Quick happy path
-    bin_path = _find_chromium_binary()
+    # 0) Already present?
+    bin_path = _find_binary(engine)
     if bin_path:
+        print(f"[INFO] Found {engine} binary at: {bin_path}")
         return bin_path
 
-    # 1) Try install with deps (quiet first to be fast)
-    rc, out, err = _run(
-        [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
-        strict=False
-    )
-    if verbose and rc != 0:
-        print("[install attempt 1] non-zero exit:", err or out)
+    # 1) Try install-deps (no-op on Streamlit if packages.txt already handled it)
+    _run([sys.executable, "-m", "playwright", "install-deps", engine], note=f"install-deps {engine}")
 
-    bin_path = _find_chromium_binary()
+    # 2) Try regular install with deps
+    _run([sys.executable, "-m", "playwright", "install", engine, "--with-deps"], note=f"install {engine} --with-deps")
+
+    # 3) Force re-download (sometimes caches are weird)
+    if not _find_binary(engine):
+        _run([sys.executable, "-m", "playwright", "install", engine, "--force"], note=f"install {engine} --force")
+
+    bin_path = _find_binary(engine)
     if bin_path:
-        return bin_path
+        print(f"[INFO] After install, found {engine} binary at: {bin_path}")
+    else:
+        print(f"[WARN] {engine} binary still not found after install attempts (continuing).")
+    return bin_path
 
-    # 2) Retry install loudly (capture logs for debugging)
-    rc, out, err = _run(
-        [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps", "--force"],
-        strict=False
-    )
-    if verbose:
-        print("[install attempt 2] rc=", rc)
-        if out: print("[playwright stdout]\n", out[:4000])
-        if err: print("[playwright stderr]\n", err[:4000])
-
-    bin_path = _find_chromium_binary()
-    if bin_path:
-        return bin_path
-
-    # 3) One more fallback: try non-with-deps (sometimes faster on Cloud)
-    rc, out, err = _run(
-        [sys.executable, "-m", "playwright", "install", "chromium", "--force"],
-        strict=False
-    )
-    if verbose:
-        print("[install attempt 3] rc=", rc)
-        if out: print("[playwright stdout]\n", out[:4000])
-        if err: print("[playwright stderr]\n", err[:4000])
-
-    bin_path = _find_chromium_binary()
-    if bin_path:
-        return bin_path
-
-    raise RuntimeError(
-        "Playwright Chromium not found after install attempts. "
-        "Please rerun and check logs; the runtime may have blocked the download."
-    )
-
-# --------- Public API ---------
+# ----------------- public API -----------------
 def scrape_depop(term: str, deep: bool, limits: dict) -> List[Dict]:
     """
     Sync wrapper. Tries real scrape with Playwright; falls back to sample rows if unavailable.
@@ -101,20 +93,36 @@ def scrape_depop(term: str, deep: bool, limits: dict) -> List[Dict]:
             "condition": "Good condition",
             "link": f"https://www.depop.com/search/?q={urllib.parse.quote_plus(term)}",
         }]
+
     return asyncio.run(_scrape_depop_async(term, deep, limits))
 
-# --------- Real scraper (lightweight) ---------
+# ----------------- real scraper -----------------
 async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]:
     from playwright.async_api import async_playwright
-
-    # Ensure Chromium is present and get its path
-    chromium_bin = ensure_playwright_chromium(verbose=True)
 
     base_url = f"https://www.depop.com/search/?q={urllib.parse.quote_plus(term)}"
     max_items = int(limits.get("MAX_ITEMS", 500))
     max_seconds = int(limits.get("MAX_DURATION_S", 600))
 
-    # Cloud-safe flags
+    # Try Chromium first; if not available, fall back to Firefox.
+    chromium_bin = ensure_browser("chromium")
+    use_engine = "chromium" if chromium_bin else "firefox"
+    if use_engine == "firefox":
+        firefox_bin = ensure_browser("firefox")
+        if not firefox_bin:
+            # If we have neither, return a friendly sample row instead of crashing
+            print("[ERROR] No Playwright browsers available. Returning sample row.")
+            return [{
+                "platform": "Depop",
+                "brand": "Supreme",
+                "item_name": f"{term} (sample)",
+                "price": "$199",
+                "size": "L",
+                "condition": "Good condition",
+                "link": f"https://www.depop.com/search/?q={urllib.parse.quote_plus(term)}",
+            }]
+
+    # Cloud-safe flags for Chromium; Firefox ignores unsupported flags
     launch_args = [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -124,12 +132,33 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
     ]
 
     async with async_playwright() as p:
-        # If Playwright still complains about missing executable, explicitly pass the path we found.
-        browser = await p.chromium.launch(
-            headless=True,
-            args=launch_args,
-            executable_path=chromium_bin  # <— key difference
-        )
+        # Choose engine and executable_path when we found one
+        if use_engine == "chromium":
+            browser_type = p.chromium
+            exe = chromium_bin
+        else:
+            browser_type = p.firefox
+            exe = _find_binary("firefox")  # may be None (Playwright manages internally)
+
+        # Launch
+        try:
+            if exe:
+                browser = await browser_type.launch(headless=True, args=launch_args, executable_path=exe)
+            else:
+                browser = await browser_type.launch(headless=True, args=launch_args)
+        except Exception as e:
+            print(f"[ERROR] Launch failed for {use_engine}: {e}")
+            # Final fallback: return sample row rather than crash the UI
+            return [{
+                "platform": "Depop",
+                "brand": "Supreme",
+                "item_name": f"{term} (sample)",
+                "price": "$199",
+                "size": "L",
+                "condition": "Good condition",
+                "link": f"https://www.depop.com/search/?q={urllib.parse.quote_plus(term)}",
+            }]
+
         ctx = await browser.new_context(
             user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -137,7 +166,7 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
         page = await ctx.new_page()
         await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
 
-        # Best-effort: accept cookies
+        # Best-effort: accept cookies if shown
         try:
             for sel in [
                 "button:has-text('Accept')",
@@ -152,7 +181,7 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
         except Exception:
             pass
 
-        # Infinite scroll collector
+        # Infinite scroll collector (simple, robust)
         start = time.time()
         seen = set()
         rows: List[Dict] = []
@@ -165,6 +194,7 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
                     continue
                 seen.add(href)
 
+                # Pull nearby text for brand/price (very loose heuristic)
                 li = await a.evaluate_handle("el => el.closest('li') || el.parentElement")
                 price = ""
                 brand = ""
