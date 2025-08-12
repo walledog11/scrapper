@@ -1,24 +1,22 @@
-# Minimal set for Playwright/Chromium headless on Streamlit Cloud (Debian/Ubuntu)
+# System libs for Playwright browsers on Streamlit Cloud
+ca-certificates
+fonts-liberation
+libasound2
+libatk-bridge2.0-0
+libatk1.0-0
+libatspi2.0-0
+libdrm2
+libgbm1
+libgtk-3-0
 libnss3
 libnspr4
-libatk1.0-0
-libatk-bridge2.0-0
-libdrm2
-libxkbcommon0
-libgbm1
-libasound2
-libatspi2.0-0
+libpango-1.0-0
+libpangocairo-1.0-0
 libx11-6
 libxcomposite1
 libxdamage1
 libxext6
 libxfixes3
+libxkbcommon0
 libxrandr2
-libpango-1.0-0
-libpangocairo-1.0-0
-libgtk-3-0
-libcups2
-ca-certificates
-fonts-liberation
-libcurl4
 libxshmfence1
