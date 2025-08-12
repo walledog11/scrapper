@@ -1,11 +1,15 @@
+# app.py — simplified, clean UI for Depop scraper (Streamlit Cloud–ready)
+
 import os, io, csv, time
 from typing import List, Dict
 import streamlit as st
 
-# --- Page setup
+# -----------------------------------------------------------------------------
+# Page setup
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="Depop Scraper", page_icon="🧢", layout="wide")
 
-# --- Session defaults
+# Session defaults (prevents missing-key warnings on first render)
 for k, v in {
     "query": "Supreme Box Logo",
     "deep": True,
@@ -16,27 +20,35 @@ for k, v in {
 }.items():
     st.session_state.setdefault(k, v)
 
-# --- Global styles
+# -----------------------------------------------------------------------------
+# Global CSS (fonts, layout polish, sidebar toggle text fix)
+# -----------------------------------------------------------------------------
 st.markdown("""
 <style>
 :root{
+  /* Condensed, clean, system-safe stack */
   --ui-font: 'Google Sans','Roboto Condensed','Arial Narrow',system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans',sans-serif;
 }
+
+/* Global font + slight letter spacing for readability */
 html, body, [class*="st-"]{
   font-family: var(--ui-font) !important;
   letter-spacing: .1px;
 }
+
+/* Headings: no clipping, nice rhythm */
 h1,h2,h3,h4{
   font-family: var(--ui-font) !important;
   font-weight: 700 !important;
   line-height: 1.2 !important;
-  margin: 0 0 .3rem 0 !important;
+  margin: 0 0 .35rem 0 !important;
 }
-.stTextInput input,
-.stToggle, .stCheckbox, .stSlider,
-.stButton>button{
-  font-family: var(--ui-font) !important;
-}
+
+/* Container spacing */
+.block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 1200px;}
+footer {visibility: hidden;}
+
+/* Cards */
 .app-card{
   background: var(--secondary-background-color);
   border: 1px solid rgba(255,255,255,.08);
@@ -44,33 +56,79 @@ h1,h2,h3,h4{
   padding: 1rem;
   box-shadow: 0 1px 10px rgba(0,0,0,.12);
 }
+
+/* Buttons & inputs */
 .stButton>button{
+  font-family: var(--ui-font) !important;
+  font-weight: 700;
   border-radius: 10px;
   padding: .65rem 1rem;
-  font-weight: 700;
 }
+.stTextInput input{ font-family: var(--ui-font) !important; }
+
+/* KPI badges */
 .badge{
   display:inline-block; padding:.25rem .6rem; border-radius:999px; font-size:.8rem;
   border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.06);
 }
+
+/* ---- Sidebar collapse control “keyboard_double_arrow_right” fix ----
+   Streamlit sometimes renders a text label instead of an icon.
+   The rules below hide that text and inject a chevron. We target broadly
+   so it’s resilient across Streamlit versions.
+*/
+[data-testid="stSidebar"] [data-testid="baseButton-header"] span,
+[data-testid="stSidebar"] button[kind="header"] span,
+[data-testid="stSidebar"] button span:has(> svg + span),
+[data-testid="stSidebar"] button span {
+  /* If any text leaks (e.g. 'keyboard_double_arrow_right'), hide it */
+  font-size: 0 !important;
+  line-height: 0 !important;
+}
+
+[data-testid="stSidebar"] [data-testid="baseButton-header"],
+[data-testid="stSidebar"] button[kind="header"],
+[data-testid="stSidebar"] button {
+  position: relative;
+}
+
+/* Add a clean chevron to the toggle */
+[data-testid="stSidebar"] [data-testid="baseButton-header"]::before,
+[data-testid="stSidebar"] button[kind="header"]::before,
+[data-testid="stSidebar"] button::before {
+  content: '❯';
+  font-size: 14px;
+  line-height: 1;
+  display: inline-block;
+  margin-right: 2px;
+  vertical-align: middle;
+}
+
+/* Remove hidden overflow that can clip headings in some themes */
 .block-container, .main, .stApp { overflow: visible !important; }
 </style>
 """, unsafe_allow_html=True)
 
+# -----------------------------------------------------------------------------
+# First-time help text
+# -----------------------------------------------------------------------------
 FIRST_TIME_HELP = """
 **First time setup**
 1) In Streamlit Cloud → **Settings → Secrets**, add your Google service account under  
    **`[google_service_account]`** with a triple-quoted `private_key`.
-2) Share your target Google Sheet with the service account email (Editor).
-3) That’s it — run a search and the app will write to your sheet.
+2) Share your Google Sheet with the service account email (Editor).
+3) Run a search and the app will write to your sheet.
 """
 
+# -----------------------------------------------------------------------------
+# Header / Controls / Health / Results
+# -----------------------------------------------------------------------------
 def render_header():
     left, right = st.columns([0.85, 0.15], vertical_alignment="center")
     with left:
         st.markdown(
             """
-            <h2 style="font-family: var(--ui-font); font-weight: 700; font-size: 1.9rem; margin: 0 0 .2rem 0;">
+            <h2 style="font-family: var(--ui-font); font-weight: 700; font-size: 1.9rem; margin: 0 0 .25rem 0;">
               🧢 Depop Scraper
             </h2>
             <p style="margin: 0; opacity: .8;">
@@ -89,23 +147,27 @@ def render_header():
 
 def render_controls():
     st.markdown("<div class='app-card'>", unsafe_allow_html=True)
+    # Perfectly aligned row: search | deep toggle | run button
     c1, c2, c3 = st.columns([0.66, 0.17, 0.17], vertical_alignment="center")
+
     with c1:
         st.session_state.query = st.text_input(
             "Search term",
             value=st.session_state.get("query", "Supreme Box Logo"),
-            placeholder="e.g. palace hoodie, arcteryx alpha...",
-            label_visibility="collapsed"
+            placeholder="e.g. palace hoodie, arcteryx alpha…",
+            label_visibility="collapsed",
         )
         st.caption("Search term")
+
     with c2:
         st.session_state.deep = st.toggle(
             "Deep fetch",
             value=st.session_state.get("deep", True),
             help="Visit item pages to extract Size & Condition.",
-            label_visibility="collapsed"
+            label_visibility="collapsed",
         )
         st.caption("Deep fetch")
+
     with c3:
         st.session_state.run = st.button("🚀 Run scrape", use_container_width=True, type="primary")
         st.caption(" ")
@@ -116,16 +178,16 @@ def render_health():
     with ft:
         st.markdown(FIRST_TIME_HELP)
     with health:
-        st.info("Playwright: auto-installed at runtime on the cloud (with fallbacks).")
+        st.info("Playwright: auto-installed at runtime in the cloud (with fallbacks).")
         st.info("Google Sheets: Service Account from secrets or local credentials.json.")
         st.write("**credentials.json present?**", os.path.exists("credentials.json"))
         try:
-            import creds_loader
+            import creds_loader  # noqa: F401
             st.success("✅ creds_loader imported")
         except Exception as e:
             st.warning(f"⚠️ creds_loader import failed: {e}")
         try:
-            import depop_scraper_lib
+            import depop_scraper_lib  # noqa: F401
             st.success("✅ depop_scraper_lib imported")
         except Exception as e:
             st.warning(f"⚠️ depop_scraper_lib import failed: {e}")
@@ -137,22 +199,28 @@ def render_results(rows: List[Dict], sheet_name: str):
     with k3:
         brands = len({r.get('brand','').strip() for r in rows if r.get('brand')})
         st.metric("Brand coverage", brands)
+
     tabs = st.tabs(["📄 Table", "📥 Download CSV", "🪵 Logs"])
     with tabs[0]:
         if rows:
             from pandas import DataFrame
             df = DataFrame(rows, columns=["platform","brand","item_name","price","size","condition","link"])
-            st.dataframe(df, use_container_width=True, column_config={
-                "link": st.column_config.LinkColumn("Link", help="Open listing"),
-                "platform": st.column_config.TextColumn("Platform", width="small"),
-                "brand": st.column_config.TextColumn("Brand", width="medium"),
-                "item_name": st.column_config.TextColumn("Item Name", width="large"),
-                "price": st.column_config.TextColumn("Price", width="small"),
-                "size": st.column_config.TextColumn("Size", width="small"),
-                "condition": st.column_config.TextColumn("Condition", width="medium"),
-            })
+            st.dataframe(
+                df,
+                use_container_width=True,
+                column_config={
+                    "link": st.column_config.LinkColumn("Link", help="Open listing"),
+                    "platform": st.column_config.TextColumn("Platform", width="small"),
+                    "brand": st.column_config.TextColumn("Brand", width="medium"),
+                    "item_name": st.column_config.TextColumn("Item Name", width="large"),
+                    "price": st.column_config.TextColumn("Price", width="small"),
+                    "size": st.column_config.TextColumn("Size", width="small"),
+                    "condition": st.column_config.TextColumn("Condition", width="medium"),
+                }
+            )
         else:
             st.warning("No rows to display yet.")
+
     with tabs[1]:
         if rows:
             output = io.StringIO()
@@ -172,6 +240,7 @@ def render_results(rows: List[Dict], sheet_name: str):
             )
         else:
             st.info("Run a scrape to enable download.")
+
     with tabs[2]:
         logs = st.session_state.get("logs", [])
         if logs:
@@ -179,34 +248,39 @@ def render_results(rows: List[Dict], sheet_name: str):
         else:
             st.info("Logs will appear here while scraping.")
 
-# --- Imports
+# -----------------------------------------------------------------------------
+# Imports: Google Sheets auth + scraper (your existing modules)
+# -----------------------------------------------------------------------------
 try:
     from creds_loader import authorize_gspread
 except Exception:
     authorize_gspread = None
+
 try:
     from depop_scraper_lib import scrape_depop
 except Exception:
     scrape_depop = None
 
-# --- Sidebar with Unicode arrows instead of icons
+# -----------------------------------------------------------------------------
+# Sidebar (kept as-is, just grouped)
+# -----------------------------------------------------------------------------
 with st.sidebar:
-    st.header("» Settings")
+    st.header("Settings")
     IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
     prefer_local = st.toggle("Prefer local credentials.json (debug)", value=not IS_CLOUD)
     SHEET_NAME = st.text_input("Google Sheet name", value="depop_scraper", help="Spreadsheet (doc) name")
     RESET_SHEET = st.toggle("Reset tab headers on write", value=False)
 
-    st.subheader("» Limits")
+    st.subheader("Limits")
     MAX_ITEMS = st.number_input("Max items (safety cap)", min_value=100, max_value=20000, value=3000, step=100)
     MAX_DURATION_S = st.number_input("Max duration (seconds)", min_value=60, max_value=3600, value=900, step=30)
 
-    st.subheader("» Deep fetch")
+    st.subheader("Deep fetch")
     DEEP_FETCH_MAX = st.number_input("Max deep-fetched items", min_value=50, max_value=5000, value=1000, step=50)
     DEEP_FETCH_CONCURRENCY = st.slider("Deep fetch concurrency", 1, 6, 3)
     DEEP_FETCH_DELAY_MIN, DEEP_FETCH_DELAY_MAX = st.slider("Per detail page delay (ms)", 200, 4000, (800, 1600))
 
-    st.subheader("» Advanced scrolling")
+    st.subheader("Advanced scrolling")
     MAX_ROUNDS = st.number_input("Max scroll rounds", min_value=10, max_value=2000, value=400, step=10)
     WARMUP_ROUNDS = st.number_input("Warmup rounds", min_value=0, max_value=100, value=6, step=1)
     IDLE_ROUNDS = st.number_input("Stop if no growth for N rounds", min_value=2, max_value=30, value=6, step=1)
@@ -214,11 +288,14 @@ with st.sidebar:
     NETWORK_IDLE_TIMEOUT = st.number_input("Network-idle timeout (ms)", min_value=1000, max_value=20000, value=5000, step=500)
     PAUSE_MIN, PAUSE_MAX = st.slider("Jitter between scrolls (ms)", 200, 1500, (500, 900))
 
-# --- Main area
+# -----------------------------------------------------------------------------
+# Main layout
+# -----------------------------------------------------------------------------
 render_header()
 render_controls()
 render_health()
 
+# Attempt Google Sheets auth (deferred: UI renders even if this fails)
 gc = None
 if authorize_gspread:
     try:
@@ -230,10 +307,14 @@ if authorize_gspread:
         st.session_state["local_creds_ok"] = False
         st.info(f"Sheets auth not ready (UI continues): {e}")
 
+# -----------------------------------------------------------------------------
+# Run button handler
+# -----------------------------------------------------------------------------
 if st.session_state.get("run"):
     st.session_state.logs = []
     def log(msg: str):
         st.session_state.logs.append(msg)
+
     limits = dict(
         MAX_ITEMS=int(MAX_ITEMS),
         MAX_DURATION_S=int(MAX_DURATION_S),
@@ -249,6 +330,7 @@ if st.session_state.get("run"):
         PAUSE_MIN=int(PAUSE_MIN),
         PAUSE_MAX=int(PAUSE_MAX),
     )
+
     rows: List[Dict] = []
     if scrape_depop is None:
         log("Could not import scraper module — returning sample row.")
@@ -266,23 +348,29 @@ if st.session_state.get("run"):
             log(f"Scrape error: {e}")
         dur = time.time() - start
         log(f"Finished in {dur:.1f}s, {len(rows)} rows.")
+
+    # Save to Google Sheets if authorized
     if gc and rows:
         try:
             import gspread
             headers = ["Platform","Brand","Item Name","Price","Size","Condition","Link"]
+
             try:
                 sh = gc.open(SHEET_NAME)
             except gspread.SpreadsheetNotFound:
                 sh = gc.create(SHEET_NAME)
+
             tab_title = st.session_state.query[:99] or "Sheet1"
             try:
                 ws = sh.worksheet(tab_title)
             except gspread.WorksheetNotFound:
                 ws = sh.add_worksheet(title=tab_title, rows="5000", cols=str(len(headers)))
                 ws.append_row(headers)
+
             if RESET_SHEET or not ws.get_all_values():
                 ws.clear()
                 ws.append_row(headers)
+
             payload = [[
                 r.get("platform","Depop"),
                 r.get("brand",""),
@@ -292,10 +380,13 @@ if st.session_state.get("run"):
                 r.get("condition",""),
                 r.get("link",""),
             ] for r in rows]
+
             BATCH = 300
             for i in range(0, len(payload), BATCH):
                 ws.append_rows(payload[i:i+BATCH], value_input_option="RAW")
+
             st.success(f"✅ Saved {len(rows)} rows to **{SHEET_NAME} / {tab_title}**")
         except Exception as e:
             st.warning(f"Could not write to Google Sheets: {e}")
+
     render_results(rows, SHEET_NAME)
