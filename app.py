@@ -18,14 +18,20 @@ for k, v in {
 }.items():
     st.session_state.setdefault(k, v)
 
-# --- Lightweight CSS polish
+# --- Fonts & CSS (use Roboto Mono as a public stand-in for “Google Sans Code”)
 st.markdown("""
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+
 <style>
 :root{
-  --ui-font: 'Roboto Condensed','Arial Narrow',system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans',sans-serif;
+  /* Closest widely-available look to “Google Sans Code” without self-hosting */
+  --ui-font: 'Roboto Mono', ui-monospace, SFMono-Regular, Menlo, Monaco,
+             Consolas, "Liberation Mono", "Noto Sans Mono", monospace;
 }
 
-/* Global font + subtle tightening to mimic condensed look even without Roboto Condensed installed */
+/* Global font + tiny tracking */
 html, body, [class*="st-"]{
   font-family: var(--ui-font) !important;
   letter-spacing: .1px;
@@ -35,7 +41,7 @@ html, body, [class*="st-"]{
 h1,h2,h3,h4{
   font-family: var(--ui-font) !important;
   font-weight: 700 !important;
-  line-height: 1.2 !important;
+  line-height: 1.25 !important;
   margin: 0 0 .3rem 0 !important;
 }
 
@@ -68,11 +74,10 @@ h1,h2,h3,h4{
   border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.06);
 }
 
-/* Remove any hidden overflow that can clip headings in some themes */
+/* Avoid clipping in some themes */
 .block-container, .main, .stApp { overflow: visible !important; }
 </style>
 """, unsafe_allow_html=True)
-
 
 # --- First-time help (edit as you wish)
 FIRST_TIME_HELP = """
@@ -106,7 +111,6 @@ def render_header():
         else:
             st.markdown("<div class='badge'>🔴 No creds</div>", unsafe_allow_html=True)
 
-
 def render_controls():
     st.markdown("<div class='app-card'>", unsafe_allow_html=True)
 
@@ -114,7 +118,6 @@ def render_controls():
     c1, c2, c3 = st.columns([0.66, 0.17, 0.17], vertical_alignment="center")
 
     with c1:
-        # Collapse the label to avoid extra label height; add caption under for clarity
         st.session_state.query = st.text_input(
             "Search term",
             value=st.session_state.get("query", "Supreme Box Logo"),
@@ -137,8 +140,6 @@ def render_controls():
         st.caption(" ")
 
     st.markdown("</div>", unsafe_allow_html=True)
-
-
 
 def render_health():
     ft, health = st.tabs(["🧭 First time?", "🩺 Health check"])
@@ -226,24 +227,24 @@ try:
 except Exception:
     scrape_depop = None
 
-# --- Sidebar (unchanged logic)
+# --- Sidebar (unchanged logic — but replace icon names with Unicode arrows)
 with st.sidebar:
-    st.header("Settings")
+    st.header("» Settings")
     IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
     prefer_local = st.toggle("Prefer local credentials.json (debug)", value=not IS_CLOUD)
     SHEET_NAME = st.text_input("Google Sheet name", value="depop_scraper", help="Spreadsheet (doc) name")
     RESET_SHEET = st.toggle("Reset tab headers on write", value=False)
 
-    st.subheader("Limits")
+    st.subheader("» Limits")
     MAX_ITEMS = st.number_input("Max items (safety cap)", min_value=100, max_value=20000, value=3000, step=100)
     MAX_DURATION_S = st.number_input("Max duration (seconds)", min_value=60, max_value=3600, value=900, step=30)
 
-    st.subheader("Deep fetch")
+    st.subheader("» Deep fetch")
     DEEP_FETCH_MAX = st.number_input("Max deep-fetched items", min_value=50, max_value=5000, value=1000, step=50)
     DEEP_FETCH_CONCURRENCY = st.slider("Deep fetch concurrency", 1, 6, 3)
     DEEP_FETCH_DELAY_MIN, DEEP_FETCH_DELAY_MAX = st.slider("Per detail page delay (ms)", 200, 4000, (800, 1600))
 
-    st.subheader("Advanced scrolling")
+    st.subheader("» Advanced scrolling")
     MAX_ROUNDS = st.number_input("Max scroll rounds", min_value=10, max_value=2000, value=400, step=10)
     WARMUP_ROUNDS = st.number_input("Warmup rounds", min_value=0, max_value=100, value=6, step=1)
     IDLE_ROUNDS = st.number_input("Stop if no growth for N rounds", min_value=2, max_value=30, value=6, step=1)
