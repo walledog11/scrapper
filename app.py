@@ -7,6 +7,17 @@ import streamlit as st
 # --- Page setup (keep favicon/emoji if you like)
 st.set_page_config(page_title="Depop Scraper", page_icon="🧢", layout="wide")
 
+# --- SESSION DEFAULTS (prevents missing-key issues on first render)
+for k, v in {
+    "query": "Supreme Box Logo",
+    "deep": True,
+    "run": False,
+    "logs": [],
+    "secrets_ok": False,
+    "local_creds_ok": False,
+}.items():
+    st.session_state.setdefault(k, v)
+
 # --- Lightweight CSS polish
 st.markdown("""
 <style>
@@ -48,7 +59,6 @@ def render_header():
         st.markdown("### 🧢 Depop Scraper")
         st.caption("Search Depop, deep-scrape size & condition, and export to Google Sheets.")
     with right:
-        # Badge shows which creds we’re using
         if st.session_state.get("secrets_ok"):
             st.markdown("<div class='badge'>🟢 Secrets OK</div>", unsafe_allow_html=True)
         elif st.session_state.get("local_creds_ok"):
@@ -81,7 +91,7 @@ def render_health():
     with ft:
         st.markdown(FIRST_TIME_HELP)
     with health:
-        st.info("Playwright: auto-installed at runtime on the cloud.")
+        st.info("Playwright: auto-installed at runtime on the cloud (with fallbacks).")
         st.info("Google Sheets: Service Account from secrets or local credentials.json.")
         st.write("**credentials.json present?**", os.path.exists("credentials.json"))
         try:
@@ -96,7 +106,6 @@ def render_health():
             st.warning(f"⚠️ depop_scraper_lib import failed: {e}")
 
 def render_results(rows: List[Dict], sheet_name: str):
-    # KPIs
     k1, k2, k3 = st.columns(3)
     with k1: st.metric("Items scraped", len(rows))
     with k2: st.metric("Saved to Sheets", sheet_name)
@@ -152,7 +161,7 @@ def render_results(rows: List[Dict], sheet_name: str):
         else:
             st.info("Logs will appear here while scraping.")
 
-# --- Import your helpers (Google Sheets auth + scraping)
+# --- Import helpers (Google Sheets auth + scraping)
 try:
     from creds_loader import authorize_gspread
 except Exception:
@@ -163,7 +172,7 @@ try:
 except Exception:
     scrape_depop = None
 
-# --- Sidebar (UNCHANGED logic, but consolidated visually)
+# --- Sidebar (unchanged logic)
 with st.sidebar:
     st.header("Settings")
     IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
@@ -193,12 +202,11 @@ render_header()
 render_controls()
 render_health()
 
-# --- Attempt Google Sheets auth (deferred: only when needed)
+# --- Attempt Google Sheets auth (deferred)
 gc = None
 if authorize_gspread:
     try:
         gc = authorize_gspread(prefer_local=prefer_local)
-        # Mark which path worked (for header badge)
         st.session_state["secrets_ok"] = not prefer_local
         st.session_state["local_creds_ok"] = prefer_local
     except Exception as e:
@@ -212,7 +220,6 @@ if st.session_state.get("run"):
     def log(msg: str):
         st.session_state.logs.append(msg)
 
-    # Build limits for scraper
     limits = dict(
         MAX_ITEMS=int(MAX_ITEMS),
         MAX_DURATION_S=int(MAX_DURATION_S),
@@ -229,7 +236,6 @@ if st.session_state.get("run"):
         PAUSE_MAX=int(PAUSE_MAX),
     )
 
-    # Run scrape (falls back to sample row if Playwright not available)
     rows: List[Dict] = []
     if scrape_depop is None:
         log("Could not import scraper module — returning sample row.")
@@ -248,19 +254,17 @@ if st.session_state.get("run"):
         dur = time.time() - start
         log(f"Finished in {dur:.1f}s, {len(rows)} rows.")
 
-    # Save to Google Sheets (if authed)
+    # Save to Google Sheets if authorized
     if gc and rows:
         try:
             import gspread
             headers = ["Platform","Brand","Item Name","Price","Size","Condition","Link"]
 
-            # open or create the doc
             try:
                 sh = gc.open(SHEET_NAME)
             except gspread.SpreadsheetNotFound:
                 sh = gc.create(SHEET_NAME)
 
-            # open or create a tab named after the query (trim to 99 chars)
             tab_title = st.session_state.query[:99] or "Sheet1"
             try:
                 ws = sh.worksheet(tab_title)
@@ -268,12 +272,10 @@ if st.session_state.get("run"):
                 ws = sh.add_worksheet(title=tab_title, rows="5000", cols=str(len(headers)))
                 ws.append_row(headers)
 
-            # enforce headers if reset or empty
             if RESET_SHEET or not ws.get_all_values():
                 ws.clear()
                 ws.append_row(headers)
 
-            # batch append (avoid 429 write bursts)
             payload = [[
                 r.get("platform","Depop"),
                 r.get("brand",""),
@@ -292,5 +294,4 @@ if st.session_state.get("run"):
         except Exception as e:
             st.warning(f"Could not write to Google Sheets: {e}")
 
-    # Show results area
     render_results(rows, SHEET_NAME)
