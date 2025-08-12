@@ -21,32 +21,55 @@ for k, v in {
 # --- Lightweight CSS polish
 st.markdown("""
 <style>
-footer {visibility: hidden;}
-.block-container {padding-top: 1rem; padding-bottom: 2.5rem; max-width: 1200px;}
-h1, h2, h3, .stMarkdown h3 { 
-    letter-spacing: .2px;
-    font-family: "Courier New", monospace !important;
+:root{
+  --ui-font: 'Roboto Condensed','Arial Narrow',system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans',sans-serif;
 }
-.stButton>button {
-  border-radius: 10px;
-  padding: .6rem 1rem;
-  font-weight: 600;
+
+/* Global font + subtle tightening to mimic condensed look even without Roboto Condensed installed */
+html, body, [class*="st-"]{
+  font-family: var(--ui-font) !important;
+  letter-spacing: .1px;
 }
-.app-card {
+
+/* Headings: bold, proper line-height, no clipping */
+h1,h2,h3,h4{
+  font-family: var(--ui-font) !important;
+  font-weight: 700 !important;
+  line-height: 1.2 !important;
+  margin: 0 0 .3rem 0 !important;
+}
+
+/* Inputs & buttons inherit the same font */
+.stTextInput input,
+.stToggle, .stCheckbox, .stSlider,
+.stButton>button{
+  font-family: var(--ui-font) !important;
+}
+
+/* Card look */
+.app-card{
   background: var(--secondary-background-color);
   border: 1px solid rgba(255,255,255,.08);
   border-radius: 14px;
-  padding: 1rem 1rem .75rem 1rem;
+  padding: 1rem;
   box-shadow: 0 1px 10px rgba(0,0,0,.12);
 }
-.badge {
+
+/* Nicer buttons */
+.stButton>button{
+  border-radius: 10px;
+  padding: .65rem 1rem;
+  font-weight: 700;
+}
+
+/* Badge */
+.badge{
   display:inline-block; padding:.25rem .6rem; border-radius:999px; font-size:.8rem;
   border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.06);
 }
-.st-emotion-cache-1f391n5, .st-emotion-cache-1vbkxwb { /* Align inputs/buttons/toggles */
-    display: flex;
-    align-items: center;
-}
+
+/* Remove any hidden overflow that can clip headings in some themes */
+.block-container, .main, .stApp { overflow: visible !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -66,16 +89,11 @@ def render_header():
     with left:
         st.markdown(
             """
-            <h2 style="
-                font-family: 'Courier New', monospace;
-                font-weight: 700;
-                font-size: 1.9rem;
-                margin-bottom: 0.2rem;
-            ">
-            🧢 Depop Scraper
+            <h2 style="font-family: var(--ui-font); font-weight: 700; font-size: 1.9rem; margin: 0 0 .2rem 0;">
+              🧢 Depop Scraper
             </h2>
-            <p style="margin-top: 0; color: gray; font-size: 0.95rem;">
-                Search Depop, deep-scrape size & condition, and export to Google Sheets.
+            <p style="margin: 0; opacity: .8;">
+              Search Depop, deep-scrape size & condition, and export to Google Sheets.
             </p>
             """,
             unsafe_allow_html=True
@@ -90,24 +108,36 @@ def render_header():
 
 
 def render_controls():
-    with st.container():
-        st.markdown("<div class='app-card'>", unsafe_allow_html=True)
-        c1, c2, c3 = st.columns([4, 1.5, 1.5], vertical_alignment="center")
-        with c1:
-            st.session_state.query = st.text_input(
-                "Search term",
-                value=st.session_state.get("query", "Supreme Box Logo"),
-                placeholder="e.g. palace hoodie, arcteryx alpha..."
-            )
-        with c2:
-            st.session_state.deep = st.toggle(
-                "Deep fetch",
-                value=st.session_state.get("deep", True),
-                help="Visit item pages to extract Size & Condition."
-            )
-        with c3:
-            st.session_state.run = st.button("🚀 Run scrape", use_container_width=True, type="primary")
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("<div class='app-card'>", unsafe_allow_html=True)
+
+    # One row, perfectly aligned: search | deep toggle | run button
+    c1, c2, c3 = st.columns([0.66, 0.17, 0.17], vertical_alignment="center")
+
+    with c1:
+        # Collapse the label to avoid extra label height; add caption under for clarity
+        st.session_state.query = st.text_input(
+            "Search term",
+            value=st.session_state.get("query", "Supreme Box Logo"),
+            placeholder="e.g. palace hoodie, arcteryx alpha...",
+            label_visibility="collapsed"
+        )
+        st.caption("Search term")
+
+    with c2:
+        st.session_state.deep = st.toggle(
+            "Deep fetch",
+            value=st.session_state.get("deep", True),
+            help="Visit item pages to extract Size & Condition.",
+            label_visibility="collapsed"
+        )
+        st.caption("Deep fetch")
+
+    with c3:
+        st.session_state.run = st.button("🚀 Run scrape", use_container_width=True, type="primary")
+        st.caption(" ")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
 
 
 def render_health():
