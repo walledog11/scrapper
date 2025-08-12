@@ -1,7 +1,38 @@
-Put your Google service account JSON as **credentials.json**, OR configure **GOOGLE_SERVICE_ACCOUNT** in Streamlit Secrets.
+# depop_scraper.py
+# Streamlit + Playwright scraper for Depop with Google Sheets output
+# Paste this entire file to avoid indentation / missing-import issues.
+
+import os, sys, json, csv, io, time, random, subprocess, urllib.parse, asyncio
+from typing import List, Dict
+
+import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
+from playwright.async_api import async_playwright
+
+# ---------- UI text ----------
+INSTALL_TEXT = """
+**Google credentials**
+Use one of:
+1) Add a `[google_service_account]` table in Streamlit Secrets (recommended), or
+2) Set `GOOGLE_SERVICE_ACCOUNT` as a JSON string in Secrets, or
+3) Place a local `credentials.json` in this folder (for local dev).
+
+**Playwright (local)**
+
 """
 
-# ========== Ensure Playwright browser is present (Cloud-safe) ==========
+# ---------- Streamlit page ----------
+st.set_page_config(page_title="Depop Scraper", page_icon="🧢", layout="wide")
+st.title("🧢 Depop Scraper")
+
+with st.expander("First time? Setup help", expanded=False):
+    st.markdown(INSTALL_TEXT)
+
+IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
+DEFAULT_HEADLESS = True if IS_CLOUD else False
+
+# ---------- Ensure Playwright Chromium (safe on Cloud) ----------
 @st.cache_resource(show_spinner=False)
 def _ensure_playwright():
     try:
@@ -15,34 +46,11 @@ def _ensure_playwright():
 
 _ensure_playwright()
 
-# ========== Imports that can fail if deps missing ==========
-try:
-    from playwright.async_api import async_playwright
-except Exception:
-    st.error("Playwright not available. Run `pip3 install playwright` and `python3 -m playwright install chromium`.")
-    st.stop()
-
-try:
-    import gspread
-    from oauth2client.service_account import ServiceAccountCredentials
-except Exception:
-    st.error("Google Sheets libs missing. Run `pip3 install gspread oauth2client`.")
-    st.stop()
-
-# ========== Page / sidebar config ==========
-st.set_page_config(page_title="Depop Scraper", page_icon="🧢", layout="wide")
-st.title("🧢 Depop Scraper (Streamlit, single file)")
-
-with st.expander("First time? Setup help"):
-    st.markdown(INSTALL_TEXT)
-
-IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
-DEFAULT_HEADLESS = True if IS_CLOUD else False
-
+# ---------- Sidebar controls ----------
 with st.sidebar:
     st.header("Settings")
-    default_sheet = "depop_scraper"
-    SHEET_NAME = st.text_input("Google Sheet name", value=default_sheet, help="Spreadsheet (doc) name, not the tab.")
+    SHEET_NAME = st.text_input("Google Sheet name", value="depop_scraper",
+                               help="Spreadsheet (doc) name, not the tab.")
     HEADLESS = st.toggle("Run headless (recommended on Cloud)", value=DEFAULT_HEADLESS)
     DEEP_FETCH = st.toggle("Deep fetch product pages for Size/Condition", value=True)
     RESET_SHEET = st.toggle("Reset sheet tab (clear & rewrite headers)", value=False)
@@ -62,37 +70,54 @@ with st.sidebar:
     NETWORK_IDLE_TIMEOUT = st.number_input("Network-idle timeout (ms)", min_value=1000, max_value=20000, value=5000, step=500)
     DEEP_FETCH_DELAY_MIN, DEEP_FETCH_DELAY_MAX = st.slider("Per detail page delay (ms)", 200, 4000, (800, 1600))
 
-# ========== Google Sheets creds loader (Secrets or local file) ==========
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+# ---------- Google credentials ----------
+SHEETS_SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 SHEET_HEADERS = ["Platform","Brand","Item Name","Price","Size","Condition","Link"]
 
-def load_google_credentials():
-    # Prefer a single JSON string secret named GOOGLE_SERVICE_ACCOUNT
-    if "GOOGLE_SERVICE_ACCOUNT" in st.secrets:
-        try:
-            creds_dict = json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
-        except Exception:
-            st.error("Your GOOGLE_SERVICE_ACCOUNT secret is not valid JSON.")
-            st.stop()
-        return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
-    # Backward-compat: nested dict secret (e.g., [google_service_account] table)
-    if "google_service_account" in st.secrets:
-        return ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["google_service_account"]), SCOPE)
-    # Local file for dev
-    if os.path.exists("credentials.json"):
-        return ServiceAccountCredentials.from_json_keyfile_name("credentials.json", SCOPE)
-    st.error("❌ No Google credentials found. Provide `credentials.json` locally or set GOOGLE_SERVICE_ACCOUNT in Secrets.")
-    st.stop()
+from creds_loader import authorize_gspread  # NEW
 
+# Replace your open_worksheet() to use the shared client:
 def open_worksheet(doc_name: str, title: str, force_reset: bool = False):
-    creds = load_google_credentials()
-    client = gspread.authorize(creds)
-    doc = client.open(doc_name)
+    import gspread
+    SHEET_HEADERS = ["Platform","Brand","Item Name","Price","Size","Condition","Link"]
+
+    client = authorize_gspread()  # << use shared
+    try:
+        doc = client.open(doc_name)
+    except gspread.SpreadsheetNotFound:
+        doc = client.create(doc_name)
+
     try:
         ws = doc.worksheet(title[:99])
     except gspread.WorksheetNotFound:
         ws = doc.add_worksheet(title=title[:99], rows=5000, cols=len(SHEET_HEADERS))
         force_reset = True
+
+    vals = ws.get_all_values()
+    if force_reset or not vals or vals[0] != SHEET_HEADERS:
+        ws.clear()
+        ws.append_row(SHEET_HEADERS)
+    return ws
+
+
+def open_worksheet(doc_name: str, title: str, force_reset: bool = False):
+    creds = load_google_credentials()
+    client = gspread.authorize(creds)
+    # Open or create spreadsheet
+    try:
+        doc = client.open(doc_name)
+    except gspread.SpreadsheetNotFound:
+        doc = client.create(doc_name)
+    # Open or create worksheet
+    try:
+        ws = doc.worksheet(title[:99])
+    except gspread.WorksheetNotFound:
+        ws = doc.add_worksheet(title=title[:99], rows=5000, cols=len(SHEET_HEADERS))
+        force_reset = True
+    # Ensure headers
     vals = ws.get_all_values()
     if force_reset or not vals or vals[0] != SHEET_HEADERS:
         ws.clear()
@@ -112,7 +137,7 @@ def save_to_google_sheets(ws, rows: List[Dict]):
     if payload:
         ws.append_rows(payload, value_input_option="RAW")
 
-# ========== Scraper helpers ==========
+# ---------- Scrape helpers ----------
 def build_search_url(term: str) -> str:
     return f"https://www.depop.com/search/?q={urllib.parse.quote_plus(term)}"
 
@@ -251,7 +276,6 @@ DETAIL_EXTRACT_JS = r"""
   let size = getSizeDOM();
   let condition = getConditionDOM();
 
-  // JSON & microdata fallbacks
   function parseJSONSafe(text) { try { return JSON.parse(text); } catch { return null; } }
   function tryNextData() {
     const s = document.querySelector('#__NEXT_DATA__');
@@ -299,7 +323,6 @@ DETAIL_EXTRACT_JS = r"""
     return map[slug] || s;
   }
 
-  // Microdata
   if (!condition) {
     const meta = document.querySelector('[itemprop="itemCondition"][content]');
     if (meta && meta.getAttribute('content')) {
@@ -331,7 +354,6 @@ DETAIL_EXTRACT_JS = r"""
     }
   }
 
-  // Text fallbacks
   const bodyText = document.body.innerText;
   if (!size) {
     const m = bodyText.match(/\b(?:size|sz)\s*[:\-]?\s*([A-Za-z0-9./\- ]{1,12})/i);
@@ -393,7 +415,8 @@ async def dismiss_cookie_banner(page):
     except:
         pass
 
-async def infinite_collect(page, max_rounds, warmup, idle_rounds, pause_min, pause_max, net_idle_every, net_idle_timeout, max_items, max_duration_s, log_cb):
+async def infinite_collect(page, max_rounds, warmup, idle_rounds, pause_min, pause_max,
+                           net_idle_every, net_idle_timeout, max_items, max_duration_s, log_cb):
     last_total = 0
     stable = 0
     start = time.time()
@@ -427,7 +450,9 @@ async def infinite_collect(page, max_rounds, warmup, idle_rounds, pause_min, pau
             log_cb("Hit MAX_DURATION_S; stopping.")
             break
 
-async def deep_fetch_worker(context, links: List[str], base_rows_by_link: Dict[str, Dict], results_out: List[Dict], sem: asyncio.Semaphore, delay_min_ms: int, delay_max_ms: int, log_cb):
+async def deep_fetch_worker(context, links: List[str], base_rows_by_link: Dict[str, Dict],
+                            results_out: List[Dict], sem: asyncio.Semaphore,
+                            delay_min_ms: int, delay_max_ms: int, log_cb):
     page = await context.new_page()
     try:
         for link in links:
@@ -444,7 +469,10 @@ async def deep_fetch_worker(context, links: List[str], base_rows_by_link: Dict[s
                 except Exception as e:
                     details = {}
                     log_cb(f"Detail error: {link} -> {e}")
-                base = base_rows_by_link.get(link, {"platform":"Depop","brand":"","item_name":"","price":"","size":"","condition":"","link":link})
+                base = base_rows_by_link.get(link, {
+                    "platform":"Depop","brand":"","item_name":"","price":"",
+                    "size":"","condition":"","link":link
+                })
                 out = {
                     "platform": "Depop",
                     "brand": base.get("brand",""),
@@ -505,7 +533,8 @@ async def scrape_depop(term: str, headless: bool, deep: bool, limits: dict, log_
             results_out: List[Dict] = []
             batches = [links[i::limits["DEEP_FETCH_CONCURRENCY"]] for i in range(limits["DEEP_FETCH_CONCURRENCY"])]
             tasks = [
-                deep_fetch_worker(context, batch, by_link, results_out, sem, limits["DEEP_FETCH_DELAY_MIN"], limits["DEEP_FETCH_DELAY_MAX"], log_cb)
+                deep_fetch_worker(context, batch, by_link, results_out, sem,
+                                  limits["DEEP_FETCH_DELAY_MIN"], limits["DEEP_FETCH_DELAY_MAX"], log_cb)
                 for batch in batches if batch
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -516,9 +545,10 @@ async def scrape_depop(term: str, headless: bool, deep: bool, limits: dict, log_
         await browser.close()
     return all_rows
 
-# ========== UI ==========
+# ---------- UI ----------
 st.subheader("Run a scrape")
-query = st.text_input("Search term", value="Supreme Box Logo", help="Example: 'palace hoodie', 'arcteryx alpha', etc.")
+query = st.text_input("Search term", value="Supreme Box Logo",
+                      help="e.g. 'palace hoodie', 'arcteryx alpha', etc.")
 run_btn = st.button("Run Scrape", type="primary")
 
 log_area = st.empty()
@@ -563,7 +593,7 @@ if run_btn:
             st.dataframe(rows[:200])
             output = io.StringIO()
             writer = csv.writer(output)
-            writer.writerow(["Platform","Brand","Item Name","Price","Size","Condition","Link"])
+            writer.writerow(SHEET_HEADERS)
             for r in rows:
                 writer.writerow([
                     r.get("platform","Depop"),
@@ -574,6 +604,8 @@ if run_btn:
                     r.get("condition",""),
                     r.get("link",""),
                 ])
-            st.download_button("Download CSV", data=output.getvalue().encode("utf-8"),
-                               file_name=f"depop_{query.replace(' ','_')}.csv", mime="text/csv")
+            st.download_button("Download CSV",
+                               data=output.getvalue().encode("utf-8"),
+                               file_name=f"depop_{query.replace(' ','_')}.csv",
+                               mime="text/csv")
         status.update(label="Scrape complete", state="complete")
