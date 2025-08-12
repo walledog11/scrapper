@@ -23,7 +23,10 @@ st.markdown("""
 <style>
 footer {visibility: hidden;}
 .block-container {padding-top: 1rem; padding-bottom: 2.5rem; max-width: 1200px;}
-h1, h2, h3 { letter-spacing: .2px; }
+h1, h2, h3, .stMarkdown h3 { 
+    letter-spacing: .2px;
+    font-family: "Courier New", monospace !important;
+}
 .stButton>button {
   border-radius: 10px;
   padding: .6rem 1rem;
@@ -40,8 +43,13 @@ h1, h2, h3 { letter-spacing: .2px; }
   display:inline-block; padding:.25rem .6rem; border-radius:999px; font-size:.8rem;
   border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.06);
 }
+.st-emotion-cache-1f391n5, .st-emotion-cache-1vbkxwb { /* Align inputs/buttons/toggles */
+    display: flex;
+    align-items: center;
+}
 </style>
 """, unsafe_allow_html=True)
+
 
 # --- First-time help (edit as you wish)
 FIRST_TIME_HELP = """
@@ -56,8 +64,22 @@ FIRST_TIME_HELP = """
 def render_header():
     left, right = st.columns([0.85, 0.15], vertical_alignment="center")
     with left:
-        st.markdown("### 🧢 Depop Scraper")
-        st.caption("Search Depop, deep-scrape size & condition, and export to Google Sheets.")
+        st.markdown(
+            """
+            <h2 style="
+                font-family: 'Courier New', monospace;
+                font-weight: 700;
+                font-size: 1.9rem;
+                margin-bottom: 0.2rem;
+            ">
+            🧢 Depop Scraper
+            </h2>
+            <p style="margin-top: 0; color: gray; font-size: 0.95rem;">
+                Search Depop, deep-scrape size & condition, and export to Google Sheets.
+            </p>
+            """,
+            unsafe_allow_html=True
+        )
     with right:
         if st.session_state.get("secrets_ok"):
             st.markdown("<div class='badge'>🟢 Secrets OK</div>", unsafe_allow_html=True)
@@ -66,10 +88,11 @@ def render_header():
         else:
             st.markdown("<div class='badge'>🔴 No creds</div>", unsafe_allow_html=True)
 
+
 def render_controls():
     with st.container():
         st.markdown("<div class='app-card'>", unsafe_allow_html=True)
-        c1, c2, c3 = st.columns([4,1,1])
+        c1, c2, c3 = st.columns([4, 1.5, 1.5], vertical_alignment="center")
         with c1:
             st.session_state.query = st.text_input(
                 "Search term",
@@ -85,6 +108,7 @@ def render_controls():
         with c3:
             st.session_state.run = st.button("🚀 Run scrape", use_container_width=True, type="primary")
         st.markdown("</div>", unsafe_allow_html=True)
+
 
 def render_health():
     ft, health = st.tabs(["🧭 First time?", "🩺 Health check"])
