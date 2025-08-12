@@ -1,160 +1,57 @@
-# app.py — simplified & robust UI (no ligatures), header unclipped
-
 import os, io, csv, time
 from typing import List, Dict
 import streamlit as st
 
-# ---------------- Page config
+# --- Page setup
 st.set_page_config(page_title="Depop Scraper", page_icon="🧢", layout="wide")
 
-# ---------------- Session defaults (avoid missing keys)
-for k, v in {
-    "query": "Supreme Box Logo",
-    "deep": True,
-    "run": False,
-    "logs": [],
-    "secrets_ok": False,
-    "local_creds_ok": False,
-}.items():
-    st.session_state.setdefault(k, v)
-
-# ---------------- Fonts & CSS (no external fonts; fix header clipping; remove ligatures)
-st.markdown("""
-<style>
-:root{
-  --ui-font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
-             Arial, "Noto Sans", "Liberation Sans", sans-serif;
-}
-
-/* Global font + spacing */
-html, body, .stApp, [class*="st-"] {
-  font-family: var(--ui-font) !important;
-  letter-spacing: .1px;
-}
-
-/* Prevent clipping: ensure containers don't hide overflow */
-.stApp, .block-container, .main {
-  overflow: visible !important;
-}
-
-/* Headings: taller line-height and no negative margins */
-h1, h2, h3, h4 {
-  line-height: 1.25 !important;
-  margin: 0 0 .4rem 0 !important;
-  font-weight: 700 !important;
-}
-
-/* Cards & buttons */
-.app-card {
-  background: var(--secondary-background-color);
-  border: 1px solid rgba(255,255,255,.08);
-  border-radius: 14px;
-  padding: 1rem;
-  box-shadow: 0 1px 10px rgba(0,0,0,.12);
-}
-.stButton>button {
-  border-radius: 10px;
-  padding: .65rem 1rem;
-  font-weight: 700;
-}
-
-/* Tiny status chip */
-.badge {
-  display:inline-block; padding:.25rem .6rem; border-radius:999px; font-size:.8rem;
-  border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.06);
-}
-
-/* If any .material-icons slipped in from old code, hide it so ligature text never shows */
-.material-icons, .material-symbols-outlined, .material-symbols-rounded {
-  display: none !important;
-}
-
-/* Sidebar expander caret: use pure CSS triangle (no ligatures) */
-.sidebar-expander summary::marker { content: ""; }
-.sidebar-expander summary::before {
-  content: "▸"; /* closed */
-  display: inline-block;
-  width: 1.1em;
-  margin-right: .25rem;
-  transition: transform .15s ease;
-}
-.sidebar-expander[open] summary::before {
-  content: "▾"; /* open */
-}
-
-/* Align input row cleanly */
-.row-align .stColumn {
-  display: flex; flex-direction: column; justify-content: center;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# ---------------- Helper: simple arrows (no ligatures)
-ARROWS = {
-    "right": "▸",
-    "down": "▾",
-    "double_right": "»",
-    "double_left": "«",
-}
-
-# ---------------- First-time tips
-FIRST_TIME_HELP = f"""
+# --- First-time help text
+FIRST_TIME_HELP = """
 **First time setup**
 1) In Streamlit Cloud → **Settings → Secrets**, add your Google service account under  
    **`[google_service_account]`** with a triple-quoted `private_key`.
 2) Share your target Google Sheet with the service account email (Editor).
-3) Run a search and the app will write to your sheet.
+3) That’s it — run a search and the app will write to your sheet.
 """
 
-# ---------------- Header
+# --- Helpers to render UI sections
 def render_header():
     left, right = st.columns([0.85, 0.15], vertical_alignment="center")
     with left:
-        st.markdown(
-            """
-            <h2 style="font-weight:700;font-size:1.9rem;margin:0 0 .25rem 0;">
-              🧢 Depop Scraper
-            </h2>
-            <p style="margin:0;opacity:.8;">Search Depop, deep-scrape size & condition, and export to Google Sheets.</p>
-            """,
-            unsafe_allow_html=True
-        )
+        st.markdown("### 🧢 Depop Scraper")
+        st.caption("Search Depop, deep-scrape size & condition, and export to Google Sheets.")
     with right:
         if st.session_state.get("secrets_ok"):
-            st.markdown("<div class='badge'>🟢 Secrets OK</div>", unsafe_allow_html=True)
+            st.markdown("🟢 Secrets OK")
         elif st.session_state.get("local_creds_ok"):
-            st.markdown("<div class='badge'>🟡 Local creds</div>", unsafe_allow_html=True)
+            st.markdown("🟡 Local creds")
         else:
-            st.markdown("<div class='badge'>🔴 No creds</div>", unsafe_allow_html=True)
+            st.markdown("🔴 No creds")
 
-# ---------------- Controls (one clean row; no ligatures)
 def render_controls():
-    st.markdown("<div class='app-card'>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns([0.66, 0.17, 0.17], vertical_alignment="center")
-    with c1:
-        st.session_state.query = st.text_input(
-            "Search term", value=st.session_state.get("query", "Supreme Box Logo"),
-            placeholder="e.g. palace hoodie, arcteryx alpha...", label_visibility="collapsed"
-        )
-        st.caption("Search term")
-    with c2:
-        st.session_state.deep = st.toggle(
-            "Deep fetch", value=st.session_state.get("deep", True),
-            help="Visit item pages to extract Size & Condition.", label_visibility="collapsed"
-        )
-        st.caption("Deep fetch")
-    with c3:
-        st.session_state.run = st.button("🚀 Run scrape", use_container_width=True, type="primary")
-        st.caption(" ")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with st.container():
+        c1, c2, c3 = st.columns([4,1,1])
+        with c1:
+            st.session_state.query = st.text_input(
+                "Search term",
+                value=st.session_state.get("query", "Supreme Box Logo"),
+                placeholder="e.g. palace hoodie, arcteryx alpha..."
+            )
+        with c2:
+            st.session_state.deep = st.toggle(
+                "Deep fetch",
+                value=st.session_state.get("deep", True),
+                help="Visit item pages to extract Size & Condition."
+            )
+        with c3:
+            st.session_state.run = st.button("🚀 Run scrape", use_container_width=True, type="primary")
 
-# ---------------- Health / help tabs (no ligatures in titles)
 def render_health():
     ft, health = st.tabs(["🧭 First time?", "🩺 Health check"])
     with ft:
         st.markdown(FIRST_TIME_HELP)
     with health:
-        st.info("Playwright: auto-installed at runtime on the cloud (with fallbacks).")
+        st.info("Playwright: auto-installed at runtime on the cloud.")
         st.info("Google Sheets: Service Account from secrets or local credentials.json.")
         st.write("**credentials.json present?**", os.path.exists("credentials.json"))
         try:
@@ -168,7 +65,6 @@ def render_health():
         except Exception as e:
             st.warning(f"⚠️ depop_scraper_lib import failed: {e}")
 
-# ---------------- Results
 def render_results(rows: List[Dict], sheet_name: str):
     k1, k2, k3 = st.columns(3)
     with k1: st.metric("Items scraped", len(rows))
@@ -182,20 +78,10 @@ def render_results(rows: List[Dict], sheet_name: str):
         if rows:
             from pandas import DataFrame
             df = DataFrame(rows, columns=["platform","brand","item_name","price","size","condition","link"])
-            st.dataframe(
-                df, use_container_width=True,
-                column_config={
-                    "link": st.column_config.LinkColumn("Link", help="Open listing"),
-                    "platform": st.column_config.TextColumn("Platform", width="small"),
-                    "brand": st.column_config.TextColumn("Brand", width="medium"),
-                    "item_name": st.column_config.TextColumn("Item Name", width="large"),
-                    "price": st.column_config.TextColumn("Price", width="small"),
-                    "size": st.column_config.TextColumn("Size", width="small"),
-                    "condition": st.column_config.TextColumn("Condition", width="medium"),
-                }
-            )
+            st.dataframe(df, use_container_width=True)
         else:
             st.warning("No rows to display yet.")
+
     with tabs[1]:
         if rows:
             output = io.StringIO()
@@ -210,16 +96,20 @@ def render_results(rows: List[Dict], sheet_name: str):
                 "Download CSV",
                 output.getvalue().encode("utf-8"),
                 file_name=f"depop_{st.session_state.query.replace(' ','_')}.csv",
-                mime="text/csv", use_container_width=True
+                mime="text/csv",
+                use_container_width=True
             )
         else:
             st.info("Run a scrape to enable download.")
+
     with tabs[2]:
         logs = st.session_state.get("logs", [])
-        if logs: st.code("\n".join(logs), language="text")
-        else: st.info("Logs will appear here while scraping.")
+        if logs:
+            st.code("\n".join(logs), language="text")
+        else:
+            st.info("Logs will appear here while scraping.")
 
-# ---------------- Imports: creds + scraper
+# --- Import helpers (Google Sheets auth + scraping)
 try:
     from creds_loader import authorize_gspread
 except Exception:
@@ -230,7 +120,7 @@ try:
 except Exception:
     scrape_depop = None
 
-# ---------------- Sidebar (plain text, no ligatures)
+# --- Sidebar
 with st.sidebar:
     st.header("Settings")
     IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
@@ -255,12 +145,12 @@ with st.sidebar:
     NETWORK_IDLE_TIMEOUT = st.number_input("Network-idle timeout (ms)", min_value=1000, max_value=20000, value=5000, step=500)
     PAUSE_MIN, PAUSE_MAX = st.slider("Jitter between scrolls (ms)", 200, 1500, (500, 900))
 
-# ---------------- Main
+# --- Main
 render_header()
 render_controls()
 render_health()
 
-# Sheets auth (deferred)
+# --- Attempt Google Sheets auth
 gc = None
 if authorize_gspread:
     try:
@@ -272,18 +162,26 @@ if authorize_gspread:
         st.session_state["local_creds_ok"] = False
         st.info(f"Sheets auth not ready (UI continues): {e}")
 
-# Scrape action
+# --- Run scrape
 if st.session_state.get("run"):
     st.session_state.logs = []
-    def log(msg: str): st.session_state.logs.append(msg)
+    def log(msg: str):
+        st.session_state.logs.append(msg)
 
     limits = dict(
-        MAX_ITEMS=int(MAX_ITEMS), MAX_DURATION_S=int(MAX_DURATION_S),
-        DEEP_FETCH_MAX=int(DEEP_FETCH_MAX), DEEP_FETCH_CONCURRENCY=int(DEEP_FETCH_CONCURRENCY),
-        DEEP_FETCH_DELAY_MIN=int(DEEP_FETCH_DELAY_MIN), DEEP_FETCH_DELAY_MAX=int(DEEP_FETCH_DELAY_MAX),
-        MAX_ROUNDS=int(MAX_ROUNDS), WARMUP_ROUNDS=int(WARMUP_ROUNDS), IDLE_ROUNDS=int(IDLE_ROUNDS),
-        NETWORK_IDLE_EVERY=int(NETWORK_IDLE_EVERY), NETWORK_IDLE_TIMEOUT=int(NETWORK_IDLE_TIMEOUT),
-        PAUSE_MIN=int(PAUSE_MIN), PAUSE_MAX=int(PAUSE_MAX),
+        MAX_ITEMS=int(MAX_ITEMS),
+        MAX_DURATION_S=int(MAX_DURATION_S),
+        DEEP_FETCH_MAX=int(DEEP_FETCH_MAX),
+        DEEP_FETCH_CONCURRENCY=int(DEEP_FETCH_CONCURRENCY),
+        DEEP_FETCH_DELAY_MIN=int(DEEP_FETCH_DELAY_MIN),
+        DEEP_FETCH_DELAY_MAX=int(DEEP_FETCH_DELAY_MAX),
+        MAX_ROUNDS=int(MAX_ROUNDS),
+        WARMUP_ROUNDS=int(WARMUP_ROUNDS),
+        IDLE_ROUNDS=int(IDLE_ROUNDS),
+        NETWORK_IDLE_EVERY=int(NETWORK_IDLE_EVERY),
+        NETWORK_IDLE_TIMEOUT=int(NETWORK_IDLE_TIMEOUT),
+        PAUSE_MIN=int(PAUSE_MIN),
+        PAUSE_MAX=int(PAUSE_MAX),
     )
 
     rows: List[Dict] = []
@@ -304,27 +202,35 @@ if st.session_state.get("run"):
         dur = time.time() - start
         log(f"Finished in {dur:.1f}s, {len(rows)} rows.")
 
-    # Save to Sheets
     if gc and rows:
         try:
             import gspread
             headers = ["Platform","Brand","Item Name","Price","Size","Condition","Link"]
+
             try:
                 sh = gc.open(SHEET_NAME)
             except gspread.SpreadsheetNotFound:
                 sh = gc.create(SHEET_NAME)
+
             tab_title = st.session_state.query[:99] or "Sheet1"
             try:
                 ws = sh.worksheet(tab_title)
             except gspread.WorksheetNotFound:
                 ws = sh.add_worksheet(title=tab_title, rows="5000", cols=str(len(headers)))
                 ws.append_row(headers)
+
             if RESET_SHEET or not ws.get_all_values():
-                ws.clear(); ws.append_row(headers)
+                ws.clear()
+                ws.append_row(headers)
 
             payload = [[
-                r.get("platform","Depop"), r.get("brand",""), r.get("item_name",""),
-                r.get("price",""), r.get("size",""), r.get("condition",""), r.get("link",""),
+                r.get("platform","Depop"),
+                r.get("brand",""),
+                r.get("item_name",""),
+                r.get("price",""),
+                r.get("size",""),
+                r.get("condition",""),
+                r.get("link",""),
             ] for r in rows]
 
             BATCH = 300
