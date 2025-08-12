@@ -1,15 +1,13 @@
-# app.py — simplified, clean UI for Depop scraper (Streamlit Cloud–ready)
+# app.py — modern UI for Depop scraper (Streamlit Cloud–ready)
 
 import os, io, csv, time
 from typing import List, Dict
 import streamlit as st
 
-# -----------------------------------------------------------------------------
-# Page setup
-# -----------------------------------------------------------------------------
+# ---------- Page setup ----------
 st.set_page_config(page_title="Depop Scraper", page_icon="🧢", layout="wide")
 
-# Session defaults (prevents missing-key warnings on first render)
+# ---------- Session defaults ----------
 for k, v in {
     "query": "Supreme Box Logo",
     "deep": True,
@@ -20,35 +18,41 @@ for k, v in {
 }.items():
     st.session_state.setdefault(k, v)
 
-# -----------------------------------------------------------------------------
-# Global CSS (fonts, layout polish, sidebar toggle text fix)
-# -----------------------------------------------------------------------------
+# ---------- CSS (font, header, alignment, no clipping) ----------
 st.markdown("""
 <style>
 :root{
-  /* Condensed, clean, system-safe stack */
-  --ui-font: 'Google Sans','Roboto Condensed','Arial Narrow',system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans',sans-serif;
+  /* Prefer Google Sans if installed on the system, then Inter/Roboto/system */
+  --ui-font: "Google Sans","Google Sans Text","Google Sans Display","Inter","Roboto",
+             system-ui,-apple-system,"Segoe UI","Helvetica Neue",Arial,"Noto Sans","Liberation Sans",sans-serif;
 }
 
-/* Global font + slight letter spacing for readability */
-html, body, [class*="st-"]{
+/* Global font + slight tightening */
+html, body, .stApp, [class*="st-"]{
   font-family: var(--ui-font) !important;
   letter-spacing: .1px;
 }
 
-/* Headings: no clipping, nice rhythm */
+/* Container + header: avoid clipping and let content breathe */
+.block-container{ padding-top: 0.9rem; padding-bottom: 2.2rem; max-width: 1200px; }
+.stApp, .main, .block-container, [data-testid="stHeader"]{ overflow: visible !important; }
+
+/* Headings: no clipping, sensible spacing */
 h1,h2,h3,h4{
   font-family: var(--ui-font) !important;
   font-weight: 700 !important;
-  line-height: 1.2 !important;
+  line-height: 1.25 !important;
   margin: 0 0 .35rem 0 !important;
 }
 
-/* Container spacing */
-.block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 1200px;}
-footer {visibility: hidden;}
+/* Buttons look modern */
+.stButton>button{
+  border-radius: 10px;
+  padding: .65rem 1rem;
+  font-weight: 700;
+}
 
-/* Cards */
+/* Card */
 .app-card{
   background: var(--secondary-background-color);
   border: 1px solid rgba(255,255,255,.08);
@@ -57,72 +61,35 @@ footer {visibility: hidden;}
   box-shadow: 0 1px 10px rgba(0,0,0,.12);
 }
 
-/* Buttons & inputs */
-.stButton>button{
-  font-family: var(--ui-font) !important;
-  font-weight: 700;
-  border-radius: 10px;
-  padding: .65rem 1rem;
-}
-.stTextInput input{ font-family: var(--ui-font) !important; }
-
-/* KPI badges */
+/* Badge */
 .badge{
   display:inline-block; padding:.25rem .6rem; border-radius:999px; font-size:.8rem;
   border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.06);
 }
 
-/* ---- Sidebar collapse control “keyboard_double_arrow_right” fix ----
-   Streamlit sometimes renders a text label instead of an icon.
-   The rules below hide that text and inject a chevron. We target broadly
-   so it’s resilient across Streamlit versions.
-*/
-[data-testid="stSidebar"] [data-testid="baseButton-header"] span,
-[data-testid="stSidebar"] button[kind="header"] span,
-[data-testid="stSidebar"] button span:has(> svg + span),
-[data-testid="stSidebar"] button span {
-  /* If any text leaks (e.g. 'keyboard_double_arrow_right'), hide it */
-  font-size: 0 !important;
-  line-height: 0 !important;
+/* Align the control row perfectly */
+.controls-row{
+  display: grid;
+  grid-template-columns: 1fr 220px 220px;  /* search | toggle | button */
+  gap: 12px;
+  align-items: center;                     /* vertical alignment */
 }
 
-[data-testid="stSidebar"] [data-testid="baseButton-header"],
-[data-testid="stSidebar"] button[kind="header"],
-[data-testid="stSidebar"] button {
-  position: relative;
-}
-
-/* Add a clean chevron to the toggle */
-[data-testid="stSidebar"] [data-testid="baseButton-header"]::before,
-[data-testid="stSidebar"] button[kind="header"]::before,
-[data-testid="stSidebar"] button::before {
-  content: '❯';
-  font-size: 14px;
-  line-height: 1;
-  display: inline-block;
-  margin-right: 2px;
-  vertical-align: middle;
-}
-
-/* Remove hidden overflow that can clip headings in some themes */
-.block-container, .main, .stApp { overflow: visible !important; }
+/* Remove stray icon text issues in sidebar by ensuring we never rely on icon fonts */
+[data-testid="stSidebar"] .icon-font, .icon-font { display:none !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# -----------------------------------------------------------------------------
-# First-time help text
-# -----------------------------------------------------------------------------
+# ---------- First-time help ----------
 FIRST_TIME_HELP = """
 **First time setup**
 1) In Streamlit Cloud → **Settings → Secrets**, add your Google service account under  
    **`[google_service_account]`** with a triple-quoted `private_key`.
-2) Share your Google Sheet with the service account email (Editor).
+2) Share your target Google Sheet with the service account email (Editor).
 3) Run a search and the app will write to your sheet.
 """
 
-# -----------------------------------------------------------------------------
-# Header / Controls / Health / Results
-# -----------------------------------------------------------------------------
+# ---------- Render helpers ----------
 def render_header():
     left, right = st.columns([0.85, 0.15], vertical_alignment="center")
     with left:
@@ -148,37 +115,40 @@ def render_header():
 def render_controls():
     st.markdown("<div class='app-card'>", unsafe_allow_html=True)
     # Perfectly aligned row: search | deep toggle | run button
-    c1, c2, c3 = st.columns([0.66, 0.17, 0.17], vertical_alignment="center")
+    with st.container():
+        st.markdown('<div class="controls-row">', unsafe_allow_html=True)
 
-    with c1:
+        # Search
         st.session_state.query = st.text_input(
             "Search term",
             value=st.session_state.get("query", "Supreme Box Logo"),
-            placeholder="e.g. palace hoodie, arcteryx alpha…",
+            placeholder="e.g. palace hoodie, arcteryx alpha...",
             label_visibility="collapsed",
+            key="search_input"
         )
-        st.caption("Search term")
 
-    with c2:
+        # Deep toggle
         st.session_state.deep = st.toggle(
             "Deep fetch",
             value=st.session_state.get("deep", True),
             help="Visit item pages to extract Size & Condition.",
             label_visibility="collapsed",
+            key="deep_toggle"
         )
-        st.caption("Deep fetch")
 
-    with c3:
-        st.session_state.run = st.button("🚀 Run scrape", use_container_width=True, type="primary")
-        st.caption(" ")
+        # Run button
+        st.session_state.run = st.button("🚀 Run scrape", use_container_width=True, type="primary", key="run_btn")
+
+        st.markdown('</div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 def render_health():
+    # Use a simple label with arrows/emoji, NOT icon font names (fixes the keyboard_double_arrow_right issue)
     ft, health = st.tabs(["🧭 First time?", "🩺 Health check"])
     with ft:
         st.markdown(FIRST_TIME_HELP)
     with health:
-        st.info("Playwright: auto-installed at runtime in the cloud (with fallbacks).")
+        st.info("Playwright: auto-installed at runtime on the cloud (with fallbacks).")
         st.info("Google Sheets: Service Account from secrets or local credentials.json.")
         st.write("**credentials.json present?**", os.path.exists("credentials.json"))
         try:
@@ -220,7 +190,6 @@ def render_results(rows: List[Dict], sheet_name: str):
             )
         else:
             st.warning("No rows to display yet.")
-
     with tabs[1]:
         if rows:
             output = io.StringIO()
@@ -240,7 +209,6 @@ def render_results(rows: List[Dict], sheet_name: str):
             )
         else:
             st.info("Run a scrape to enable download.")
-
     with tabs[2]:
         logs = st.session_state.get("logs", [])
         if logs:
@@ -248,9 +216,7 @@ def render_results(rows: List[Dict], sheet_name: str):
         else:
             st.info("Logs will appear here while scraping.")
 
-# -----------------------------------------------------------------------------
-# Imports: Google Sheets auth + scraper (your existing modules)
-# -----------------------------------------------------------------------------
+# ---------- Imports (keep your existing modules) ----------
 try:
     from creds_loader import authorize_gspread
 except Exception:
@@ -261,11 +227,9 @@ try:
 except Exception:
     scrape_depop = None
 
-# -----------------------------------------------------------------------------
-# Sidebar (kept as-is, just grouped)
-# -----------------------------------------------------------------------------
+# ---------- Sidebar (unchanged knobs; no icon-font labels used) ----------
 with st.sidebar:
-    st.header("Settings")
+    st.header("Settings")  # ← do not put icon-font names here
     IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
     prefer_local = st.toggle("Prefer local credentials.json (debug)", value=not IS_CLOUD)
     SHEET_NAME = st.text_input("Google Sheet name", value="depop_scraper", help="Spreadsheet (doc) name")
@@ -288,14 +252,12 @@ with st.sidebar:
     NETWORK_IDLE_TIMEOUT = st.number_input("Network-idle timeout (ms)", min_value=1000, max_value=20000, value=5000, step=500)
     PAUSE_MIN, PAUSE_MAX = st.slider("Jitter between scrolls (ms)", 200, 1500, (500, 900))
 
-# -----------------------------------------------------------------------------
-# Main layout
-# -----------------------------------------------------------------------------
+# ---------- Main ----------
 render_header()
 render_controls()
 render_health()
 
-# Attempt Google Sheets auth (deferred: UI renders even if this fails)
+# Attempt Sheets auth (deferred – won’t block UI)
 gc = None
 if authorize_gspread:
     try:
@@ -307,9 +269,7 @@ if authorize_gspread:
         st.session_state["local_creds_ok"] = False
         st.info(f"Sheets auth not ready (UI continues): {e}")
 
-# -----------------------------------------------------------------------------
-# Run button handler
-# -----------------------------------------------------------------------------
+# Button action
 if st.session_state.get("run"):
     st.session_state.logs = []
     def log(msg: str):
@@ -349,7 +309,7 @@ if st.session_state.get("run"):
         dur = time.time() - start
         log(f"Finished in {dur:.1f}s, {len(rows)} rows.")
 
-    # Save to Google Sheets if authorized
+    # Save to Google Sheets (if authed)
     if gc and rows:
         try:
             import gspread
