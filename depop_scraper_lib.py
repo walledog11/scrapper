@@ -360,7 +360,7 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
 
                 slug = href.rstrip("/").split("/")[-1].replace("-", " ")
                 item_name = slug
-                if brand and slug.lower().startsWith(brand.lower()):
+                if brand and slug.lower().startswith(brand.lower()):
                     item_name = slug[len(brand):].strip()
 
                 rows.append({
