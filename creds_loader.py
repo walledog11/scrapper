@@ -7,7 +7,15 @@ try:
 except Exception:
     st = None  # allow import without Streamlit (e.g., plain scripts/tests)
 
-
+def _badge(ok: bool, source: str, note: str | None = None):
+    if st is None:
+        return
+    if ok:
+        st.success(f"🔐 Secrets OK — using **{source}**")
+    else:
+        st.error("❌ No Google credentials detected")
+        if note:
+            st.caption(note)
 
 def authorize_gspread(prefer_local: bool = False) -> gspread.Client:
     """
