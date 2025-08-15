@@ -71,12 +71,16 @@ def render_info_section():
             st.write("**Environment**")
             st.info("✅ Playwright: Auto-installed" if True else "❌ Playwright: Missing")
             st.info("✅ Local credentials.json found" if os.path.exists("credentials.json") else "ℹ️ Using cloud credentials")
-            if st.session_state.get("secrets_ok"):
-                st.success("🔐 Secrets OK — using [google_service_account] (TOML table)")
-            elif st.session_state.get("local_creds_ok"):
-                st.info("🔐 Using local credentials.json")
-            else:
-                st.error("🔴 No Credentials Found")
+            
+            IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
+
+            if not IS_CLOUD:
+                if st.session_state.get("secrets_ok"):
+                    st.success("🔐 Secrets OK — using [google_service_account] (TOML table)")
+                elif st.session_state.get("local_creds_ok"):
+                    st.info("🔐 Using local credentials.json")
+                else:
+                    st.error("🔴 No Credentials Found")
 
         with col2:
             st.write("**Module Status**")
