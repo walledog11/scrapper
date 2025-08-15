@@ -1,371 +1,171 @@
-# depop_scraper_lib.py
-import asyncio, random, time, urllib.parse
-from typing import List, Dict, Tuple
+# depop_scraper_lib.py — robust selectors + wait strategy + price fallbacks
+import os, sys, subprocess, asyncio, random, time, urllib.parse, glob, re
+from typing import List, Dict, Optional
 
-SEARCH_URL = "https://www.depop.com/search/?q={q}"
+PLAYWRIGHT_CACHE = os.path.expanduser("~/.cache/ms-playwright")
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_CACHE)
 
-# --------------------- JavaScript snippets ---------------------
-
-# Collect listing href + rough title + rough price from search results
-LIST_COLLECT_JS = r"""
-(() => {
-  const clean = s => (s || "").replace(/\s+/g, " ").trim();
-  const anchors = Array.from(document.querySelectorAll('a[href^="/products/"]'));
-  const seen = new Set();
-  const out = [];
-
-  function extractPriceFromCard(card) {
-    if (!card) return "";
-    // 1) Explicit price nodes first
-    let node = card.querySelector('[data-testid="price"], [itemprop="price"], [class*="price"]');
-    if (node) {
-      const t = clean(node.textContent);
-      if (/[£$€]\s?\d/.test(t)) return t;
-    }
-    // 2) Any short text inside the card that looks like a currency
-    const texts = Array.from(card.querySelectorAll("p,span,div,strong"))
-      .map(n => clean(n.textContent))
-      .filter(Boolean);
-    const hit = texts.find(t => /[£$€]\s?\d/.test(t));
-    if (hit) return hit;
-
-    return "";
-  }
-
-  function extractTitleFromAnchor(a) {
-    let title = a.getAttribute("aria-label") || "";
-    if (!title) {
-      const card = a.closest("article, li, div") || a.parentElement;
-      if (card) {
-        const texts = Array.from(card.querySelectorAll("h3,h2,strong,p,span"))
-          .map(n => clean(n.textContent))
-          .filter(Boolean);
-        const pick = texts.find(t =>
-          !/[£$€]\s?\d/.test(t) && !/^by\s+/i.test(t) && t.length >= 3 && t.length <= 120
-        );
-        if (pick) title = pick;
-      }
-      if (!title) {
-        const slug = (a.getAttribute("href") || "").replace(/\/$/, "").split("/").pop() || "";
-        title = clean(decodeURIComponent(slug.replace(/-/g, " ")));
-      }
-    }
-    // strip " | seller" or " by seller"
-    const lower = title.toLowerCase();
-    if (lower.includes(" by ")) title = title.split(/ by /i)[0].trim();
-    if (title.includes(" | ")) title = title.split(" | ")[0].trim();
-    return title;
-  }
-
-  for (const a of anchors) {
-    const href = a.getAttribute("href");
-    if (!href || seen.has(href)) continue;
-    seen.add(href);
-
-    const card = a.closest("article, li, div") || a.parentElement;
-    const title = extractTitleFromAnchor(a);
-    let price = extractPriceFromCard(card);
-
-    // Fallback: some builds include price in the anchor aria-label
-    if (!price) {
-      const al = a.getAttribute("aria-label") || "";
-      const m = (al || "").match(/[£$€]\s?\d[\d.,]*/);
-      if (m) price = m[0];
-    }
-
-    out.push({ href, title, price });
-  }
-  return out;
-})()
-"""
-
-# Extract title/price/size/condition on the PDP
-DETAIL_EXTRACT_JS = r"""
-(() => {
-  const clean = s => (s || "").replace(/\s+/g,' ').trim();
-  const txt = sel => {
-    const el = document.querySelector(sel);
-    return el ? clean(el.textContent) : "";
-  };
-
-  function findTitle() {
-    return (
-      txt('h1,[data-testid="listing-title"],[itemprop="name"]') ||
-      document.title.replace(/\s*\|\s*Depop.*$/i, "").trim() ||
-      ""
-    );
-  }
-
-  function findPrice() {
-    // A) JSON-LD (Product -> offers.price)
-    try {
-      const blocks = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
-        .map(n => { try { return JSON.parse(n.textContent || "null"); } catch { return null; }})
-        .filter(Boolean);
-      for (const b of blocks) {
-        const arr = Array.isArray(b) ? b : [b];
-        for (const obj of arr) {
-          if (obj && (obj["@type"] === "Product" || obj["@type"] === "Offer" || obj.productID)) {
-            const offers = obj.offers || obj.offer || null;
-            const p = offers && (offers.price || (offers.priceSpecification && offers.priceSpecification.price));
-            const cur = (offers && (offers.priceCurrency || (offers.priceSpecification && offers.priceSpecification.priceCurrency))) || "";
-            if (p) {
-              const sym = cur === "USD" ? "$" : cur === "GBP" ? "£" : cur === "EUR" ? "€" : "";
-              return (sym ? `${sym}${p}` : `${p}`).trim();
-            }
-          }
-        }
-      }
-    } catch (e) {}
-
-    // B) Meta tags / microdata
-    const metaPrice = document.querySelector('meta[itemprop="price"], meta[property="product:price:amount"], meta[property="og:price:amount"]');
-    const metaCur   = document.querySelector('meta[itemprop="priceCurrency"], meta[property="product:price:currency"], meta[property="og:price:currency"]');
-    if (metaPrice) {
-      const p = metaPrice.getAttribute("content") || "";
-      const c = metaCur ? (metaCur.getAttribute("content") || "") : "";
-      if (p) {
-        const sym = c === "USD" ? "$" : c === "GBP" ? "£" : c === "EUR" ? "€" : "";
-        return (sym ? `${sym}${p}` : p).trim();
-      }
-    }
-
-    // C) Visible nodes
-    const nodes = [
-      '[data-testid="price"]',
-      '[itemprop="price"]',
-      'div[aria-label*="Price"]',
-      'span[aria-label*="Price"]',
-      'span[class*="price"]',
-      'div[class*="price"]'
-    ];
-    for (const sel of nodes) {
-      const el = document.querySelector(sel);
-      if (el) {
-        const t = clean(el.textContent);
-        if (/[£$€]\s?\d/.test(t)) return t;
-      }
-    }
-
-    // D) Body text fallback
-    const m = (document.body.innerText || "").match(/[£$€]\s?\d[\d.,]*/);
-    return m ? m[0] : "";
-  }
-
-  function findSize() {
-    const sel = [
-      '[data-testid="size"]',
-      'button[aria-pressed="true"]',
-      'button[aria-selected="true"]',
-      '[class*="chip"][aria-pressed="true"]',
-      '[class*="chip"][aria-selected="true"]'
-    ];
-    for (const s of sel) {
-      const el = document.querySelector(s);
-      if (el) {
-        const t = clean(el.textContent);
-        if (t && t.length <= 20) return t;
-      }
-    }
-    // Definition lists
-    const dts = Array.from(document.querySelectorAll('dt, .dt, [role="term"]'));
-    for (const dt of dts) {
-      const k = clean(dt.textContent).toLowerCase();
-      if (k.startsWith("size")) {
-        const dd = dt.nextElementSibling;
-        if (dd) {
-          const v = clean(dd.textContent);
-          if (v) return v;
-        }
-      }
-    }
-    // Text fallback
-    const m = (document.body.innerText || "").match(/\b(?:size|sz)\s*[:\-]?\s*([A-Za-z0-9./\- ]{1,12})/i);
-    return (m && m[1]) ? clean(m[1]) : "";
-  }
-
-  function findCondition() {
-    const dts = Array.from(document.querySelectorAll('dt, .dt, [role="term"]'));
-    for (const dt of dts) {
-      const k = clean(dt.textContent).toLowerCase();
-      if (k.startsWith("condition")) {
-        const dd = dt.nextElementSibling;
-        if (dd) {
-          const v = clean(dd.textContent);
-          if (v) return v;
-        }
-      }
-    }
-    const blocks = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
-      .map(n => { try { return JSON.parse(n.textContent || "null"); } catch { return null; }})
-      .filter(Boolean);
-    for (const b of blocks) {
-      const m = JSON.stringify(b).match(/(NewCondition|UsedCondition|RefurbishedCondition|DamagedCondition)/);
-      if (m && m[1]) {
-        const map = {NewCondition:"Brand New", UsedCondition:"Used", RefurbishedCondition:"Refurbished", DamagedCondition:"Damaged"};
-        return map[m[1]] || m[1];
-      }
-    }
-    const body = document.body.innerText || "";
-    const m = body.match(/\b(brand\s*new|new with tags|new without tags|excellent|very good|good|fair|poor)\s+condition\b/i);
-    return (m && m[0]) ? clean(m[0]) : "";
-  }
-
-  return { title: findTitle(), price: findPrice(), size: findSize(), condition: findCondition() };
-})()
-"""
-
-# --------------------- Python helpers ---------------------
-
-def _full_url(href: str) -> str:
-  if href.startswith("http"):
-      return href
-  return "https://www.depop.com" + (href if href.startswith("/") else "/" + href)
-
-async def _collect_listings(page, max_items: int, max_seconds: int, log) -> List[Dict]:
-    start = time.time()
-    seen_links = set()
-    rows: List[Dict] = []
-
-    while True:
-        batch = await page.evaluate(LIST_COLLECT_JS)
-        added = 0
-        for it in batch:
-            link = _full_url(it.get("href", ""))
-            if not link or link in seen_links:
-                continue
-            seen_links.add(link)
-
-            raw_title = (it.get("title") or "").strip()
-            title = raw_title
-            lower = raw_title.lower()
-            if " by " in lower:
-                title = raw_title.split(" by ", 1)[0].strip()
-            if " | " in title:
-                title = title.split(" | ", 1)[0].strip()
-
-            price = (it.get("price") or "").strip()
-
-            rows.append({
-                "platform": "Depop",
-                "brand": "",
-                "item_name": title,
-                "price": price or "",   # may be filled during deep fetch
-                "size": "",
-                "condition": "",
-                "link": link,
-            })
-            added += 1
-            if len(rows) >= max_items:
-                break
-
-        log(f"Collected: {len(rows)} (+{added})")
-        if len(rows) >= max_items or (time.time() - start) > max_seconds:
-            break
-
-        await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(random.randint(450, 900))
-        if added == 0:
-            try:
-                await page.wait_for_load_state("networkidle", timeout=4000)
-            except Exception:
-                pass
-
-    return rows
-
-async def _deep_fetch(context, links: List[str], base_by_link: Dict[str, Dict], delay_ms: Tuple[int,int], sem, log):
-    page = await context.new_page()
+# ----------------- helpers -----------------
+def _run(cmd, note=""):
     try:
-        for link in links:
-            async with sem:
-                try:
-                    await page.goto(link, wait_until="domcontentloaded", timeout=60000)
-                    await page.evaluate("window.scrollBy(0, document.body.scrollHeight * 0.2)")
-                    await page.wait_for_timeout(random.randint(*delay_ms))
-                    details = await page.evaluate(DETAIL_EXTRACT_JS)
-                except Exception as e:
-                    log(f"Detail error: {e}")
-                    details = {}
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = p.communicate()
+        rc = p.returncode
+        if rc != 0:
+            print(f"[WARN] {note} rc={rc}\nstdout:\n{out[:1000]}\nstderr:\n{err[:1000]}")
+        else:
+            if out:
+                print(f"[INFO] {note} stdout:\n{out[:500]}")
+        return rc, out, err
+    except Exception as e:
+        print(f"[WARN] {_short(cmd)} failed: {e}")
+        return 1, "", str(e)
 
-                base = base_by_link.get(link, {})
-                # Only overwrite if new value is non-empty
-                if details.get("title"):      base["item_name"] = details["title"]
-                if details.get("price"):      base["price"] = details["price"]
-                if details.get("size"):       base["size"] = details["size"]
-                if details.get("condition"):  base["condition"] = details["condition"]
-    finally:
-        await page.close()
+def _short(cmd):
+    try:
+        return " ".join(cmd[:4]) + (" ..." if len(cmd) > 4 else "")
+    except:
+        return str(cmd)
 
-# --------------------- Public API ---------------------
+def _find_binary(engine: str) -> Optional[str]:
+    pats = []
+    if engine == "chromium":
+        pats = [
+            os.path.join(PLAYWRIGHT_CACHE, "chromium_headless_shell-*", "chrome-linux", "headless_shell"),
+            os.path.join(PLAYWRIGHT_CACHE, "chromium-*", "chrome-linux", "chrome"),
+        ]
+    elif engine == "firefox":
+        pats = [os.path.join(PLAYWRIGHT_CACHE, "firefox-*", "firefox", "firefox")]
+    for pat in pats:
+        for m in sorted(glob.glob(pat)):
+            if os.path.isfile(m) and os.access(m, os.X_OK):
+                return m
+    return None
 
+def ensure_browser(engine: str) -> Optional[str]:
+    bin_path = _find_binary(engine)
+    if bin_path:
+        print(f"[INFO] Found {engine} at: {bin_path}")
+        return bin_path
+    _run([sys.executable, "-m", "playwright", "install-deps", engine], note=f"install-deps {engine}")
+    _run([sys.executable, "-m", "playwright", "install", engine, "--with-deps"], note=f"install {engine} --with-deps")
+    if not _find_binary(engine):
+        _run([sys.executable, "-m", "playwright", "install", engine, "--force"], note=f"install {engine} --force")
+    return _find_binary(engine)
+
+# ----------------- small text utils -----------------
+def _norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _clean_title(s: str) -> str:
+    s = _norm_space(s)
+    s = s.split(" | ", 1)[0]
+    s = re.sub(r"\s+by\s+.+$", "", s, flags=re.I)
+    return s
+
+def _normalize_price(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"([£$€])\s?(\d[\d.,]*)", s)
+    if m:
+        sym, amt = m.group(1), m.group(2).replace(",", "")
+        return f"{sym}{amt}"
+    m2 = re.search(r"(USD|GBP|EUR)\s?(\d[\d.,]*)", s, re.I)
+    if m2:
+        sym = {"USD": "$", "GBP": "£", "EUR": "€"}.get(m2.group(1).upper(), "")
+        amt = m2.group(2).replace(",", "")
+        return f"{sym}{amt}".strip()
+    m3 = re.search(r"(\d[\d.,]*)", s)
+    if m3:
+        amt = m3.group(1).replace(",", "")
+        return f"${amt}"
+    return ""
+
+def _is_product_link(href: str) -> bool:
+    return bool(href) and "/products/" in href
+
+# ----------------- public API -----------------
 def scrape_depop(term: str, deep: bool, limits: dict) -> List[Dict]:
     """
-    Sync entry for app.py. Falls back to a sample row if Playwright is missing.
+    Sync wrapper. Tries real scrape with Playwright; falls back to sample rows if unavailable.
     """
     try:
         from playwright.async_api import async_playwright  # noqa: F401
     except Exception:
         return [{
             "platform": "Depop",
-            "brand": "",
+            "brand": "Sample",
             "item_name": f"{term} (sample)",
-            "price": "",
-            "size": "",
-            "condition": "",
+            "price": "$199",
+            "size": "L",
+            "condition": "Good condition",
             "link": f"https://www.depop.com/search/?q={urllib.parse.quote_plus(term)}",
         }]
-
     return asyncio.run(_scrape_depop_async(term, deep, limits))
 
+# ----------------- real scraper -----------------
 async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]:
     from playwright.async_api import async_playwright
 
-    base_url = SEARCH_URL.format(q=urllib.parse.quote_plus(term))
-    max_items = int(limits.get("MAX_ITEMS", 1000))
-    max_seconds = int(limits.get("MAX_DURATION_S", 900))
+    base_url = (
+        "https://www.depop.com/search/"
+        f"?q={urllib.parse.quote_plus(term)}"
+        "&sort=relevance&country=us"
+    )
+    max_items = int(limits.get("MAX_ITEMS", 500))
+    max_seconds = int(limits.get("MAX_DURATION_S", 600))
+    deep_max = int(limits.get("DEEP_FETCH_MAX", 300))
 
-    deep_max = int(limits.get("DEEP_FETCH_MAX", 800))
-    deep_conc = int(limits.get("DEEP_FETCH_CONCURRENCY", 3))
-    dmin = int(limits.get("DEEP_FETCH_DELAY_MIN", 800))
-    dmax = int(limits.get("DEEP_FETCH_DELAY_MAX", 1600))
-    delay_ms = (dmin, dmax)
+    chromium_bin = ensure_browser("chromium")
+    engine = "chromium" if chromium_bin else "firefox"
+    if engine == "firefox" and not ensure_browser("firefox"):
+        print("[ERROR] No Playwright browsers available. Returning sample row.")
+        return [{
+            "platform": "Depop",
+            "brand": "Sample",
+            "item_name": f"{term} (sample)",
+            "price": "$199",
+            "size": "L",
+            "condition": "Good condition",
+            "link": f"https://www.depop.com/search/?q={urllib.parse.quote_plus(term)}",
+        }]
 
-    launch_args = [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-background-networking",
-        "--disable-features=Translate,BackForwardCache,AvoidUnnecessaryBeforeUnloadCheckSync",
-    ]
+    launch_args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+                   "--disable-gpu", "--disable-background-networking"]
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=launch_args)
+        browser_type = p.chromium if engine == "chromium" else p.firefox
+        exe = chromium_bin if engine == "chromium" else _find_binary("firefox")
+
+        try:
+            if exe:
+                browser = await browser_type.launch(headless=True, args=launch_args, executable_path=exe)
+            else:
+                browser = await browser_type.launch(headless=True, args=launch_args)
+        except Exception as e:
+            print(f"[ERROR] Launch failed: {e}")
+            return [{
+                "platform": "Depop",
+                "brand": "Sample",
+                "item_name": f"{term} (sample)",
+                "price": "$199",
+                "size": "L",
+                "condition": "Good condition",
+                "link": f"https://www.depop.com/search/?q={urllib.parse.quote_plus(term)}",
+            }]
+
         ctx = await browser.new_context(
             user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         )
         page = await ctx.new_page()
-
-        def log(m): print(m)
-
-        log(f"Opening: {base_url}")
         await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
 
-        # Try both selectors before we start scrolling
+        # Cookie banner best-effort
         try:
-            await page.wait_for_selector('a[href^="/products/"]', state="attached", timeout=15000)
-        except Exception:
-            await page.wait_for_selector("a[data-testid='product-card']", state="attached", timeout=20000)
-
-        # Cookie banner (best-effort)
-        try:
-            for sel in [
-                "button:has-text('Accept')",
-                "button:has-text('Accept all')",
-                "[data-testid='cookie-accept']",
-                "text=Accept cookies",
-            ]:
+            for sel in ["button:has-text('Accept')", "button:has-text('Accept all')",
+                        "[data-testid='cookie-accept']", "text=Accept cookies"]:
                 btn = await page.query_selector(sel)
                 if btn:
                     await btn.click()
@@ -373,17 +173,213 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
         except Exception:
             pass
 
-        rows = await _collect_listings(page, max_items=max_items, max_seconds=max_seconds, log=log)
+        # --- Robust wait for any product card anchor ---
+        product_selectors = [
+            "a[href^='/products/']",
+            "a[data-testid='product-card']",
+            "[data-testid='productCard'] a",
+            "article a[href*='/products/']",
+        ]
 
+        # Try attached first (less strict), then scroll and retry
+        found_any = False
+        t0 = time.time()
+        while time.time() - t0 < 30:  # up to 30s pre-warm
+            for sel in product_selectors:
+                try:
+                    await page.wait_for_selector(sel, state="attached", timeout=1500)
+                    found_any = True
+                    break
+                except Exception:
+                    continue
+            if found_any:
+                break
+            await page.evaluate("window.scrollBy(0, 800)")
+            await page.wait_for_timeout(600)
+
+        if not found_any:
+            # Final single visible wait (may still fail on Cloud due to geo/captcha)
+            try:
+                await page.wait_for_selector(product_selectors[0], state="visible", timeout=15000)
+                found_any = True
+            except Exception:
+                pass
+
+        if not found_any:
+            await browser.close()
+            raise TimeoutError("No product cards found (selectors did not match).")
+
+        # --- Collect from listing grid with progressive scrolling ---
+        rows: List[Dict] = []
+        seen = set()
+        start = time.time()
+
+        async def extract_from_card(card_handle) -> Optional[Dict]:
+            href = await card_handle.get_attribute("href")
+            if not _is_product_link(href):
+                return None
+            # brand / title / price candidates inside card
+            price = ""
+            brand = ""
+            title = ""
+
+            # try some frequent fields inside cards
+            text_bits = []
+            try:
+                txts = await page.evaluate(
+                    "el => Array.from(el.querySelectorAll('p,span,div')).map(n => n.textContent || '')", card_handle
+                )
+                text_bits = [t.strip() for t in txts if t and t.strip()]
+            except Exception:
+                pass
+
+            # price first
+            for t in text_bits:
+                m = re.search(r"[£$€]\s?\d[\d.,]*", t)
+                if m:
+                    price = m.group(0); break
+
+            # title: often first larger text; also inside aria-label on image
+            # fallbacks: remove seller via " by " or " | "
+            if text_bits:
+                # heuristics: prefer a non-price, 2+ words, ≤80 chars
+                candidates = [t for t in text_bits if not re.search(r"[£$€]\s?\d", t)]
+                if candidates:
+                    title = _clean_title(candidates[0])
+
+            # brand is tricky on grid; keep blank if unsure
+            return {
+                "platform": "Depop",
+                "brand": brand,
+                "item_name": title or "",
+                "price": _normalize_price(price),
+                "size": "",
+                "condition": "",
+                "link": f"https://www.depop.com{href}",
+            }
+
+        # Scroll/collect loop
+        while True:
+            anchors = []
+            for sel in product_selectors:
+                try:
+                    anchors = await page.query_selector_all(sel)
+                    if anchors:
+                        break
+                except Exception:
+                    continue
+
+            for a in anchors:
+                href = await a.get_attribute("href")
+                if not _is_product_link(href) or href in seen:
+                    continue
+                seen.add(href)
+
+                item = await extract_from_card(a)
+                if item:
+                    rows.append(item)
+                if len(rows) >= max_items:
+                    break
+
+            if len(rows) >= max_items: break
+            if time.time() - start > max_seconds: break
+
+            # scroll and allow lazy load
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(random.randint(500, 900))
+
+            # small idle wait every few rounds
+            # (kept simple to reduce Cloud flakiness)
+
+        # Optional deep fetch of details (size/condition/price authority)
         if deep and rows:
-            by_link = {r["link"]: r for r in rows}
-            links = list(by_link.keys())[:deep_max]
-            log(f"Deep fetching {len(links)} items…")
+            detail_count = 0
+            for r in rows:
+                if detail_count >= deep_max:
+                    break
+                link = r.get("link")
+                if not _is_product_link(link):
+                    continue
+                try:
+                    dp = await ctx.new_page()
+                    await dp.goto(link, wait_until="domcontentloaded", timeout=60000)
 
-            sem = asyncio.Semaphore(deep_conc)
-            batches = [links[i::deep_conc] for i in range(deep_conc)]
-            tasks = [_deep_fetch(ctx, b, by_link, delay_ms, sem, log) for b in batches if b]
-            await asyncio.gather(*tasks, return_exceptions=True)
+                    # safe wait for any content area
+                    try:
+                        await dp.wait_for_selector("main, article, [data-testid='product-page']", state="attached", timeout=6000)
+                    except Exception:
+                        pass
+
+                    DETAIL_JS = """
+                    (function() {
+                      const pick = (sel) => {
+                        const el = document.querySelector(sel);
+                        return el ? (el.textContent || "").trim() : "";
+                      };
+                      // Price: try structured first, then visible labels
+                      let price = pick('[data-testid="price"]') ||
+                                  pick('[itemprop="price"]') ||
+                                  pick('meta[itemprop="price"]') ||
+                                  pick('div[aria-label*="Price"]') ||
+                                  pick('span[aria-label*="Price"]') ||
+                                  pick('p[class*="Price"]') ||
+                                  pick('span[class*="Price"]');
+                      if (!price) {
+                        const m = (document.body.innerText || "").match(/[£$€]\s?\\d+[.,]?\\d*/);
+                        if (m) price = m[0];
+                      }
+                      // Title (clean)
+                      let title = pick('h1') || pick('[data-testid="product-title"]') || "";
+                      // Size / Condition (common spots)
+                      let size = pick('[data-testid="product-size"]') ||
+                                 pick('dd:has(+ dt:contains("Size"))') ||
+                                 pick('[class*="size" i]');
+                      let cond = pick('[data-testid="product-condition"]') ||
+                                 pick('dd:has(+ dt:contains("Condition"))') ||
+                                 pick('[class*="condition" i]');
+
+                      return {
+                        price: price,
+                        title: title,
+                        size: size,
+                        condition: cond
+                      };
+                    })();
+                    """
+                    info = await dp.evaluate(DETAIL_JS)
+                    # Apply back with normalization
+                    if info:
+                        r["item_name"] = _clean_title(info.get("title") or r["item_name"])
+                        r["price"] = _normalize_price(info.get("price") or r["price"])
+                        if info.get("size"): r["size"] = _norm_space(info["size"])
+                        if info.get("condition"): r["condition"] = _norm_space(info["condition"])
+
+                except Exception as e:
+                    print(f"[WARN] detail fetch failed for {link}: {e}")
+                finally:
+                    try:
+                        await dp.close()
+                    except Exception:
+                        pass
+                detail_count += 1
 
         await browser.close()
-        return rows
+
+        # Final polish: drop search links (safety), dedupe by link, normalize
+        final: List[Dict] = []
+        seen_links = set()
+        for r in rows:
+            lk = r.get("link", "")
+            if not _is_product_link(lk) or lk in seen_links:
+                continue
+            seen_links.add(lk)
+            final.append({
+                "platform": "Depop",
+                "brand": _norm_space(r.get("brand", "")),
+                "item_name": _clean_title(r.get("item_name", "")),
+                "price": _normalize_price(r.get("price", "")),
+                "size": _norm_space(r.get("size", "")),
+                "condition": _norm_space(r.get("condition", "")),
+                "link": lk,
+            })
+        return final
