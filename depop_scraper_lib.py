@@ -1,4 +1,4 @@
-# depop_scraper_lib.py — robust selectors + wait strategy + price fallbacks
+# depop_scraper_lib.py — robust selectors + wait strategy + fallbacks + logging
 import os, sys, subprocess, asyncio, random, time, urllib.parse, glob, re
 from typing import List, Dict, Optional
 
@@ -8,24 +8,19 @@ os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_CACHE)
 # ----------------- helpers -----------------
 def _run(cmd, note=""):
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        import subprocess as sp
+        p = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, text=True)
         out, err = p.communicate()
         rc = p.returncode
         if rc != 0:
-            print(f"[WARN] {note} rc={rc}\nstdout:\n{out[:1000]}\nstderr:\n{err[:1000]}")
+            print(f"[WARN] {note} rc={rc}\nstdout:\n{out[:800]}\nstderr:\n{err[:800]}")
         else:
             if out:
-                print(f"[INFO] {note} stdout:\n{out[:500]}")
+                print(f"[INFO] {note} stdout:\n{out[:400]}")
         return rc, out, err
     except Exception as e:
-        print(f"[WARN] {_short(cmd)} failed: {e}")
+        print(f"[WARN] {' '.join(cmd[:4])} ... failed: {e}")
         return 1, "", str(e)
-
-def _short(cmd):
-    try:
-        return " ".join(cmd[:4]) + (" ..." if len(cmd) > 4 else "")
-    except:
-        return str(cmd)
 
 def _find_binary(engine: str) -> Optional[str]:
     pats = []
@@ -53,12 +48,12 @@ def ensure_browser(engine: str) -> Optional[str]:
         _run([sys.executable, "-m", "playwright", "install", engine, "--force"], note=f"install {engine} --force")
     return _find_binary(engine)
 
-# ----------------- small text utils -----------------
 def _norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def _clean_title(s: str) -> str:
     s = _norm_space(s)
+    # drop " | seller" OR " by seller"
     s = s.split(" | ", 1)[0]
     s = re.sub(r"\s+by\s+.+$", "", s, flags=re.I)
     return s
@@ -67,15 +62,18 @@ def _normalize_price(raw: str) -> str:
     s = (raw or "").strip()
     if not s:
         return ""
+    # currency symbol + amount
     m = re.search(r"([£$€])\s?(\d[\d.,]*)", s)
     if m:
         sym, amt = m.group(1), m.group(2).replace(",", "")
         return f"{sym}{amt}"
+    # ISO currency as fallback
     m2 = re.search(r"(USD|GBP|EUR)\s?(\d[\d.,]*)", s, re.I)
     if m2:
-        sym = {"USD": "$", "GBP": "£", "EUR": "€"}.get(m2.group(1).upper(), "")
+        sym = {"USD":"$", "GBP":"£", "EUR":"€"}.get(m2.group(1).upper(), "")
         amt = m2.group(2).replace(",", "")
         return f"{sym}{amt}".strip()
+    # any number => assume $
     m3 = re.search(r"(\d[\d.,]*)", s)
     if m3:
         amt = m3.group(1).replace(",", "")
@@ -87,12 +85,10 @@ def _is_product_link(href: str) -> bool:
 
 # ----------------- public API -----------------
 def scrape_depop(term: str, deep: bool, limits: dict) -> List[Dict]:
-    """
-    Sync wrapper. Tries real scrape with Playwright; falls back to sample rows if unavailable.
-    """
     try:
         from playwright.async_api import async_playwright  # noqa: F401
     except Exception:
+        # fallback sample so app UI keeps working
         return [{
             "platform": "Depop",
             "brand": "Sample",
@@ -113,14 +109,14 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
         f"?q={urllib.parse.quote_plus(term)}"
         "&sort=relevance&country=us"
     )
-    max_items = int(limits.get("MAX_ITEMS", 500))
-    max_seconds = int(limits.get("MAX_DURATION_S", 600))
-    deep_max = int(limits.get("DEEP_FETCH_MAX", 300))
+    max_items    = int(limits.get("MAX_ITEMS", 500))
+    max_seconds  = int(limits.get("MAX_DURATION_S", 600))
+    deep_max     = int(limits.get("DEEP_FETCH_MAX", 300))
 
     chromium_bin = ensure_browser("chromium")
     engine = "chromium" if chromium_bin else "firefox"
     if engine == "firefox" and not ensure_browser("firefox"):
-        print("[ERROR] No Playwright browsers available. Returning sample row.")
+        print("[ERROR] No browsers available; returning sample row.")
         return [{
             "platform": "Depop",
             "brand": "Sample",
@@ -181,10 +177,10 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
             "article a[href*='/products/']",
         ]
 
-        # Try attached first (less strict), then scroll and retry
+        # pre-warm loop (attached, scroll/retry)
         found_any = False
         t0 = time.time()
-        while time.time() - t0 < 30:  # up to 30s pre-warm
+        while time.time() - t0 < 30:
             for sel in product_selectors:
                 try:
                     await page.wait_for_selector(sel, state="attached", timeout=1500)
@@ -198,7 +194,7 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
             await page.wait_for_timeout(600)
 
         if not found_any:
-            # Final single visible wait (may still fail on Cloud due to geo/captcha)
+            # one last visible attempt
             try:
                 await page.wait_for_selector(product_selectors[0], state="visible", timeout=15000)
                 found_any = True
@@ -209,56 +205,72 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
             await browser.close()
             raise TimeoutError("No product cards found (selectors did not match).")
 
-        # --- Collect from listing grid with progressive scrolling ---
-        rows: List[Dict] = []
-        seen = set()
-        start = time.time()
+        # -------- grid extraction helpers ----------
+        async def _card_texts(card) -> List[str]:
+            try:
+                # collect visible-ish text from common nodes
+                txts = await page.evaluate(
+                    """(el) => Array.from(el.querySelectorAll('img[alt], p, span, div'))
+                           .map(n => (n.alt || n.textContent || '').trim())
+                           .filter(Boolean)""",
+                    card
+                )
+                return [t for t in txts if t]
+            except Exception:
+                return []
 
-        async def extract_from_card(card_handle) -> Optional[Dict]:
-            href = await card_handle.get_attribute("href")
+        async def _extract_from_card(card) -> Optional[Dict]:
+            href = await card.get_attribute("href")
             if not _is_product_link(href):
                 return None
-            # brand / title / price candidates inside card
+
+            text_bits = await _card_texts(card)
             price = ""
-            brand = ""
             title = ""
+            brand = ""
 
-            # try some frequent fields inside cards
-            text_bits = []
-            try:
-                txts = await page.evaluate(
-                    "el => Array.from(el.querySelectorAll('p,span,div')).map(n => n.textContent || '')", card_handle
-                )
-                text_bits = [t.strip() for t in txts if t and t.strip()]
-            except Exception:
-                pass
-
-            # price first
+            # price: first currency-like on card
             for t in text_bits:
                 m = re.search(r"[£$€]\s?\d[\d.,]*", t)
                 if m:
-                    price = m.group(0); break
+                    price = m.group(0)
+                    break
 
-            # title: often first larger text; also inside aria-label on image
-            # fallbacks: remove seller via " by " or " | "
-            if text_bits:
-                # heuristics: prefer a non-price, 2+ words, ≤80 chars
-                candidates = [t for t in text_bits if not re.search(r"[£$€]\s?\d", t)]
-                if candidates:
-                    title = _clean_title(candidates[0])
+            # title candidates: image alt, aria-labels, first non-price text
+            # try image alt explicitly
+            if not title:
+                try:
+                    img = await card.query_selector("img[alt]")
+                    if img:
+                        alt = (await img.get_attribute("alt")) or ""
+                        if alt.strip():
+                            title = alt.strip()
+                except Exception:
+                    pass
 
-            # brand is tricky on grid; keep blank if unsure
+            if not title:
+                non_price = [t for t in text_bits if not re.search(r"[£$€]\s?\d", t)]
+                if non_price:
+                    title = non_price[0]
+
+            title = _clean_title(title)
+            price = _normalize_price(price)
+
             return {
                 "platform": "Depop",
-                "brand": brand,
+                "brand": brand,          # brand not reliable on grid; fill via PDP when deep
                 "item_name": title or "",
-                "price": _normalize_price(price),
+                "price": price,
                 "size": "",
                 "condition": "",
                 "link": f"https://www.depop.com{href}",
             }
 
-        # Scroll/collect loop
+        # -------- scroll & collect from grid ----------
+        rows: List[Dict] = []
+        seen = set()
+        start = time.time()
+
         while True:
             anchors = []
             for sel in product_selectors:
@@ -275,23 +287,22 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
                     continue
                 seen.add(href)
 
-                item = await extract_from_card(a)
+                item = await _extract_from_card(a)
                 if item:
                     rows.append(item)
                 if len(rows) >= max_items:
                     break
 
-            if len(rows) >= max_items: break
-            if time.time() - start > max_seconds: break
+            if len(rows) >= max_items:
+                break
+            if time.time() - start > max_seconds:
+                break
 
-            # scroll and allow lazy load
+            # scroll for more
             await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
             await page.wait_for_timeout(random.randint(500, 900))
 
-            # small idle wait every few rounds
-            # (kept simple to reduce Cloud flakiness)
-
-        # Optional deep fetch of details (size/condition/price authority)
+        # -------- PDP deep fetch (fills price/size/condition/title/brand) ----------
         if deep and rows:
             detail_count = 0
             for r in rows:
@@ -304,58 +315,92 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
                     dp = await ctx.new_page()
                     await dp.goto(link, wait_until="domcontentloaded", timeout=60000)
 
-                    # safe wait for any content area
+                    # safe base wait
                     try:
-                        await dp.wait_for_selector("main, article, [data-testid='product-page']", state="attached", timeout=6000)
+                        await dp.wait_for_selector("main, article, [data-testid='product-page']", state="attached", timeout=7000)
                     except Exception:
                         pass
 
                     DETAIL_JS = """
                     (function() {
-                      const pick = (sel) => {
+                      const pick = (sel, attr) => {
                         const el = document.querySelector(sel);
-                        return el ? (el.textContent || "").trim() : "";
+                        if (!el) return "";
+                        return attr ? (el.getAttribute(attr) || "").trim()
+                                    : (el.textContent || "").trim();
                       };
-                      // Price: try structured first, then visible labels
-                      let price = pick('[data-testid="price"]') ||
+
+                      // Price: prefer structured content attribute if present
+                      let price = pick('meta[itemprop="price"]','content') ||
                                   pick('[itemprop="price"]') ||
-                                  pick('meta[itemprop="price"]') ||
-                                  pick('div[aria-label*="Price"]') ||
-                                  pick('span[aria-label*="Price"]') ||
-                                  pick('p[class*="Price"]') ||
-                                  pick('span[class*="Price"]');
+                                  pick('[data-testid="price"]') ||
+                                  pick('div[aria-label*="Price" i]') ||
+                                  pick('span[aria-label*="Price" i]') ||
+                                  pick('p[class*="price" i]') ||
+                                  pick('span[class*="price" i]');
+
                       if (!price) {
-                        const m = (document.body.innerText || "").match(/[£$€]\s?\\d+[.,]?\\d*/);
+                        const m = (document.body.innerText || "").match(/[£$€]\\s?\\d+[.,]?\\d*/);
                         if (m) price = m[0];
                       }
-                      // Title (clean)
-                      let title = pick('h1') || pick('[data-testid="product-title"]') || "";
-                      // Size / Condition (common spots)
-                      let size = pick('[data-testid="product-size"]') ||
-                                 pick('dd:has(+ dt:contains("Size"))') ||
-                                 pick('[class*="size" i]');
-                      let cond = pick('[data-testid="product-condition"]') ||
-                                 pick('dd:has(+ dt:contains("Condition"))') ||
-                                 pick('[class*="condition" i]');
 
-                      return {
-                        price: price,
-                        title: title,
-                        size: size,
-                        condition: cond
-                      };
+                      // Title
+                      let title = pick('h1') || pick('[data-testid="product-title"]') || "";
+
+                      // Brand: sometimes near seller block; keep light
+                      let brand = pick('[data-testid="brand"]') || "";
+
+                      // Size / Condition (common definitions lists)
+                      let size = "";
+                      let condition = "";
+
+                      const dts = Array.from(document.querySelectorAll('dt'));
+                      for (const dt of dts) {
+                        const key = (dt.textContent || "").toLowerCase().trim();
+                        const dd = dt.nextElementSibling;
+                        const val = dd ? (dd.textContent || "").trim() : "";
+                        if (!val) continue;
+                        if (!size && key.includes("size")) size = val;
+                        if (!condition && (key.includes("condition") || key.includes("state"))) condition = val;
+                      }
+
+                      // also try common data-testid shortcuts
+                      size = size || pick('[data-testid="product-size"]') || "";
+                      condition = condition || pick('[data-testid="product-condition"]') || "";
+
+                      return { price, title, brand, size, condition };
                     })();
                     """
+
                     info = await dp.evaluate(DETAIL_JS)
-                    # Apply back with normalization
+
+                    # Apply with normalization/fallbacks
                     if info:
-                        r["item_name"] = _clean_title(info.get("title") or r["item_name"])
-                        r["price"] = _normalize_price(info.get("price") or r["price"])
-                        if info.get("size"): r["size"] = _norm_space(info["size"])
-                        if info.get("condition"): r["condition"] = _norm_space(info["condition"])
+                        if info.get("title"):
+                            r["item_name"] = _clean_title(info["title"])
+                        if info.get("brand"):
+                            r["brand"] = _norm_space(info["brand"])
+                        # prefer PDP price if present
+                        pdp_price = _normalize_price(info.get("price", ""))
+                        if pdp_price:
+                            r["price"] = pdp_price
+                        if info.get("size"):
+                            r["size"] = _norm_space(info["size"])
+                        if info.get("condition"):
+                            r["condition"] = _norm_space(info["condition"])
+
+                    # Safety: if still no price, try visible strong currency in snippet again
+                    if not r.get("price"):
+                        try:
+                            txt = await dp.inner_text("body", timeout=3000)
+                            m = re.search(r"[£$€]\s?\d[\d.,]*", txt)
+                            if m:
+                                r["price"] = _normalize_price(m.group(0))
+                        except Exception:
+                            pass
 
                 except Exception as e:
-                    print(f"[WARN] detail fetch failed for {link}: {e}")
+                    print(f"[WARN] PDP fetch failed for {link}: {e}")
                 finally:
                     try:
                         await dp.close()
@@ -365,7 +410,7 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
 
         await browser.close()
 
-        # Final polish: drop search links (safety), dedupe by link, normalize
+        # -------- final polish: dedupe + normalize ----------
         final: List[Dict] = []
         seen_links = set()
         for r in rows:
@@ -382,4 +427,8 @@ async def _scrape_depop_async(term: str, deep: bool, limits: dict) -> List[Dict]
                 "condition": _norm_space(r.get("condition", "")),
                 "link": lk,
             })
+        print(f"[INFO] Collected {len(final)} items.")
+        # Log a sample row to help debug visibility
+        if final:
+            print("[INFO] Sample row:", final[0])
         return final
