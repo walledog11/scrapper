@@ -325,6 +325,19 @@ if st.session_state.get("run"):
                 st.error(f"Scraping failed: {e}")
             dur = time.time() - start
             log(f"✅ Scraping completed in {dur:.1f}s — raw rows: {len(rows)}")
+            
+            if not rows:
+                log("No rows returned by scraper. Showing sample row to keep the UI responsive.")
+                rows = [{
+                    "platform": "Depop",
+                    "brand": "Sample",
+                    "item_name": f"{st.session_state.query} (sample)",
+                    "price": "$199",
+                    "size": "L",
+                    "condition": "Good condition",
+                    "link": f"https://www.depop.com/search/?q={st.session_state.query.replace(' ','%20')}"
+                }]
+
 
     # Post-process (prices, titles, links, dedupe)
     rows = postprocess_rows(rows)
