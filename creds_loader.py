@@ -11,9 +11,9 @@ def _badge(ok: bool, source: str, note: str | None = None):
     if st is None:
         return
     if ok:
-        st.success(f"🔐 Secrets OK — using **{source}**")
+        st.success
     else:
-        st.error("❌ No Google credentials detected")
+        st.error
         if note:
             st.caption(note)
 
