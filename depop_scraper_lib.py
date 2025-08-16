@@ -1,353 +1,302 @@
 # depop_scraper_lib.py
-# Hybrid scraper:
-#  - Search page via HTTP (requests) to avoid grid timeouts on Streamlit Cloud
-#  - Optional detail enrichment via Playwright (price/size/condition/title)
-#  - Safe fallbacks so the UI never crashes
+# Memory-lean Depop scraper with Playwright.
+# Public API remains: scrape_depop(term: str, deep: bool, limits: dict) -> List[Dict]
 
-import asyncio, time, random, re, urllib.parse, os
-from typing import List, Dict, Tuple, Optional
+from __future__ import annotations
+import os, time, asyncio
+from typing import List, Dict, Optional
+from urllib.parse import quote_plus
 
-import requests
-from requests.adapters import HTTPAdapter, Retry
-
-
-# ------------------------------
-# Public API
-# ------------------------------
 def scrape_depop(term: str, deep: bool, limits: dict) -> List[Dict]:
-    """
-    Hybrid flow:
-      1) Use HTTP to fetch the search page HTML and extract product links quickly.
-      2) If deep=True, open each product in Playwright (concurrently) to extract
-         price, size, condition, and a clean title/brand.
-      3) If Playwright can't launch in this environment, keep the HTTP rows;
-         if even HTTP yields nothing, return a sample row to keep UI responsive.
-    """
-    # 1) HTTP search
-    max_items = int(limits.get("MAX_ITEMS", 300))
-    max_seconds = int(limits.get("MAX_DURATION_S", 600))
+    """Sync wrapper. Returns a sample row on failure so UI doesn't crash."""
+    try:
+        from playwright.async_api import async_playwright  # noqa: F401
+    except Exception:
+        return [_sample_row(term)]
 
-    links = http_find_product_links(term, max_items=max_items, max_seconds=max_seconds)
-
-    # Construct base rows from the slug while we (optionally) enrich
-    rows = [row_from_link(term, link) for link in links]
-
-    # 2) Optional deep details via Playwright
-    if deep and rows:
+    # Ensure we only run one event loop at a time
+    try:
+        return asyncio.run(_scrape_depop_async(term, deep, limits or {}))
+    except RuntimeError:
+        # Already inside a loop (some local IDEs) — run with a new loop
+        loop = asyncio.new_event_loop()
         try:
-            details = asyncio.run(playwright_enrich(rows, limits))
-            # merge back
-            by_link = {d["link"]: d for d in details}
-            for r in rows:
-                full = by_link.get(r["link"])
-                if not full:
-                    continue
-                # Only fill missing fields or upgrade empties
-                for k in ["brand", "item_name", "price", "size", "condition"]:
-                    if full.get(k) and not r.get(k):
-                        r[k] = full[k]
-        except Exception as e:
-            print(f"[WARN] Deep enrichment failed; keeping HTTP rows. {e}")
-
-    # 3) Final fallback
-    if not rows:
-        rows = [_sample_row(term)]
-
-    # Deduplicate by link
-    dedup = {}
-    for r in rows:
-        if r.get("link"):
-            dedup[r["link"]] = r
-    return list(dedup.values())
+            return loop.run_until_complete(_scrape_depop_async(term, deep, limits or {}))
+        finally:
+            loop.close()
+    except Exception:
+        return [_sample_row(term)]
 
 
-# ------------------------------
-# HTTP search helpers
-# ------------------------------
-def _requests_session() -> requests.Session:
-    s = requests.Session()
-    retries = Retry(
-        total=3, backoff_factor=0.4,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"])
+# ---------------- Async impl ----------------
+
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+
+CARD_SELECTORS = [
+    "a[href^='/products/']",
+    "[data-testid='product-card'] a",
+    "a[data-testid^='product-']",
+]
+
+TITLE_SELECTORS = [
+    "[data-testid='product-title']",
+    "h1",
+    "div[dir='auto']",
+]
+
+PRICE_SELECTORS = [
+    "span[data-testid='price-label']",
+    "[data-testid='product-price']",
+    "span:has-text('$'), span:has-text('£'), span:has-text('€')",
+]
+
+COOKIE_SELECTORS = [
+    "button:has-text('Accept all')",
+    "button:has-text('Accept')",
+    "[data-testid='cookie-accept']",
+    "text=Accept cookies",
+]
+
+# Domains we can skip entirely to save RAM/BW
+BLOCK_HOST_SUBSTR = [
+    "google-analytics", "googletag", "doubleclick", "facebook", "tiktok",
+    "analytics", "segment", "optimizely", "hotjar", "sentry", "cdn-cookielaw"
+]
+
+# Resource types to block (keep CSS so the DOM still lays out consistently)
+BLOCK_TYPES = {"image", "media", "font"}
+
+
+async def _scrape_depop_async(query: str, deep: bool, limits: dict) -> List[Dict]:
+    MAX_ITEMS        = int(limits.get("MAX_ITEMS", 200))
+    MAX_DURATION_S   = int(limits.get("MAX_DURATION_S", 60))
+    SCROLL_ROUNDS    = int(limits.get("MAX_ROUNDS", 30))
+    PAUSE_MS         = int(limits.get("PAUSE_MIN", 350))
+    DETAIL_TIMEOUT   = int(limits.get("DETAIL_TIMEOUT_MS", 20000))
+    NETWORK_IDLE_MS  = int(limits.get("NETWORK_IDLE_MS", 8000))
+
+    search_url = (
+        "https://www.depop.com/search/"
+        f"?q={quote_plus(query)}&sort=relevance&country=us&currency=usd"
     )
-    s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.depop.com/",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    })
-    return s
+
+    launch_args = [
+        "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+        "--disable-gpu", "--disable-background-networking",
+        "--disable-background-timer-throttling",
+    ]
+
+    listings: List[Dict] = []
+    t0 = time.time()
+
+    async with async_playwright() as p:
+        # Launch browser (Chromium preferred)
+        browser = None
+        for bt in (p.chromium, p.firefox):
+            try:
+                browser = await bt.launch(headless=True, args=launch_args)
+                break
+            except Exception:
+                continue
+        if not browser:
+            return [_sample_row(query)]
+
+        # One context, request blocking on to reduce RAM/network
+        context = await browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+        )
+
+        async def _route_handler(route):
+            req = route.request
+            if req.resource_type in BLOCK_TYPES:
+                return await route.abort()
+            url = req.url.lower()
+            if any(bad in url for bad in BLOCK_HOST_SUBSTR):
+                return await route.abort()
+            return await route.continue_()
+
+        await context.route("**/*", _route_handler)
+
+        page = await context.new_page()
+
+        # Go to search
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            await context.close(); await browser.close()
+            return [_sample_row(query)]
+
+        # Accept cookies if present
+        await _maybe_click(page, COOKIE_SELECTORS)
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_MS)
+        except PWTimeout:
+            pass
+
+        # Progressive scroll & collect links (no element snapshots)
+        links = await _collect_links(page, SCROLL_ROUNDS, CARD_SELECTORS, PAUSE_MS, NETWORK_IDLE_MS)
+        links = list(dict.fromkeys(links))[:MAX_ITEMS]  # dedupe, cap
+
+        # Reuse a single detail page to keep memory low
+        detail = await context.new_page()
+        await context.route("**/*", _route_handler)  # also block in detail page
+
+        for link in links:
+            if time.time() - t0 > MAX_DURATION_S:
+                break
+            item = await _read_detail(detail, link, deep=deep, timeout_ms=DETAIL_TIMEOUT)
+            if not item["item_name"]:
+                slug = link.rstrip("/").split("/")[-1].replace("-", " ")
+                item["item_name"] = slug
+            listings.append(item)
+
+        await detail.close()
+        await context.close()
+        await browser.close()
+
+    return listings
 
 
-PRODUCT_HREF_RE = re.compile(r'href="(/products/[^"#?]+)"')
+# ---------------- helpers ----------------
 
+async def _maybe_click(page, selectors: List[str]) -> None:
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                await loc.first.click(timeout=800)
+                await page.wait_for_timeout(250)
+                return
+        except Exception:
+            pass
 
-def http_find_product_links(term: str, max_items: int = 300, max_seconds: int = 600) -> List[str]:
-    """
-    Request the Depop search HTML and pull product links via regex.
-    This works even if the grid is JS-hydrated: many links exist in initial markup.
-    """
-    base_url = "https://www.depop.com/search/?"
-    q = urllib.parse.urlencode({"q": term, "sort": "relevance", "country": "us"})
-    url = base_url + q
-
-    session = _requests_session()
-
-    start = time.time()
+async def _collect_links(page, rounds: int, selectors: List[str], pause_ms: int, idle_ms: int) -> List[str]:
     links: List[str] = []
     seen = set()
 
-    try:
-        resp = session.get(url, timeout=15)
-        html = resp.text or ""
-    except Exception as e:
-        print(f"[WARN] HTTP search failed: {e}")
-        return []
-
-    for m in PRODUCT_HREF_RE.finditer(html):
-        href = m.group(1)
-        if href in seen:
-            continue
-        seen.add(href)
-        full = f"https://www.depop.com{href}"
-        links.append(full)
-        if len(links) >= max_items:
+    # Ensure at least something is attached
+    attached = False
+    for sel in selectors:
+        try:
+            await page.wait_for_selector(sel, state="attached", timeout=8000)
+            attached = True
             break
+        except PWTimeout:
+            continue
+    if not attached:
+        return links
 
-    # if we found nothing, try a second pass: look for quoted URLs via loose regex
-    if not links:
-        ALT_RE = re.compile(r'["\'](/products/[^"\']+)["\']')
-        for m in ALT_RE.finditer(html):
-            href = m.group(1)
-            if href in seen:
-                continue
-            seen.add(href)
-            full = f"https://www.depop.com{href}"
-            links.append(full)
-            if len(links) >= max_items:
-                break
+    for _ in range(rounds):
+        for sel in selectors:
+            try:
+                cards = page.locator(sel)
+                n = await cards.count()
+                for i in range(n):
+                    a = cards.nth(i)
+                    href = await a.get_attribute("href")
+                    if not href:
+                        continue
+                    link = f"https://www.depop.com{href}" if href.startswith("/") else href
+                    if link in seen:
+                        continue
+                    seen.add(link)
+                    links.append(link)
+            except Exception:
+                pass
 
-    # Respect max_seconds (even though HTTP is quick)
-    if time.time() - start > max_seconds:
-        links = links[:max_items]
+        # Scroll and let requests settle
+        try:
+            await page.evaluate("window.scrollBy(0, Math.round(window.innerHeight * 0.9));")
+        except Exception:
+            pass
+        try:
+            await page.wait_for_load_state("networkidle", timeout=idle_ms)
+        except PWTimeout:
+            pass
+        await page.wait_for_timeout(pause_ms)
+
+        # If no growth for a while, break
+        if len(links) >= 20 and _ > 6 and len(links) == len(seen):
+            break
 
     return links
 
-
-def row_from_link(term: str, link: str) -> Dict:
-    """
-    Create a shallow row from a product link by deriving a reasonable title/brand
-    from the slug. Real details may be filled by the deep step.
-    """
-    slug = link.rstrip("/").split("/")[-1]
-    title_guess = slug.replace("-", " ").strip()
-
-    # Heuristic: remove very short tokens that look like seller names prefix/suffix
-    parts = [p for p in title_guess.split() if len(p) > 1]
-    clean_title = " ".join(parts).strip()
-
-    return {
+async def _read_detail(page, link: str, deep: bool, timeout_ms: int) -> Dict:
+    out = {
         "platform": "Depop",
         "brand": "",
-        "item_name": clean_title or term,
+        "item_name": "",
         "price": "",
         "size": "",
         "condition": "",
         "link": link,
     }
+    try:
+        resp = await page.goto(link, wait_until="domcontentloaded", timeout=timeout_ms)
+        if not resp or not resp.ok:
+            return out
+
+        # Title
+        for sel in TITLE_SELECTORS:
+            try:
+                el = page.locator(sel).first
+                await el.wait_for(state="attached", timeout=2000)
+                txt = (await el.inner_text()).strip()
+                if txt:
+                    out["item_name"] = txt
+                    break
+            except Exception:
+                pass
+
+        # Price
+        for sel in PRICE_SELECTORS:
+            try:
+                el = page.locator(sel).first
+                await el.wait_for(state="attached", timeout=2000)
+                txt = (await el.inner_text()).strip()
+                if any(c in txt for c in ("$", "£", "€")):
+                    out["price"] = txt
+                    break
+            except Exception:
+                pass
+
+        if deep:
+            # Light heuristic text scan for size/condition/brand
+            try:
+                body = await page.inner_text("body")
+                for line in body.splitlines():
+                    s = line.strip()
+                    if not s:
+                        continue
+                    low = s.lower()
+                    if "size" in low and not out["size"]:
+                        parts = s.split(":", 1)
+                        out["size"] = parts[1].strip() if len(parts) > 1 else s
+                    if "condition" in low and not out["condition"]:
+                        parts = s.split(":", 1)
+                        out["condition"] = parts[1].strip() if len(parts) > 1 else s
+                    if "brand" in low and not out["brand"]:
+                        parts = s.split(":", 1)
+                        out["brand"] = parts[1].strip() if len(parts) > 1 else s
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+    return out
 
 
 def _sample_row(term: str) -> Dict:
     return {
         "platform": "Depop",
         "brand": "Sample",
-        "item_name": f"{term} (sample result)",
-        "price": "$199",
-        "size": "L",
+        "item_name": f"{term} (sample)",
+        "price": "$99",
+        "size": "M",
         "condition": "Good",
-        "link": f"https://www.depop.com/search/?q={urllib.parse.quote_plus(term)}",
+        "link": f"https://www.depop.com/search/?q={quote_plus(term)}",
     }
-
-
-# ------------------------------
-# Playwright enrichment (details)
-# ------------------------------
-async def playwright_enrich(rows: List[Dict], limits: dict) -> List[Dict]:
-    """
-    Visit detail pages to extract price/size/condition/title/brand.
-    Launches Playwright once and fetches in parallel (limited).
-    """
-    from playwright.async_api import async_playwright
-
-    conc = max(1, int(limits.get("DEEP_FETCH_CONCURRENCY", 3)))
-    delay_min = int(limits.get("DEEP_FETCH_DELAY_MIN", 600))
-    delay_max = int(limits.get("DEEP_FETCH_DELAY_MAX", 1400))
-    limit = int(limits.get("DEEP_FETCH_MAX", len(rows)))
-
-    targets = rows[:limit]
-
-    out: List[Dict] = []
-
-    async with async_playwright() as p:
-        browser = None
-        launch_args = [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-background-networking",
-        ]
-        # Prefer Chromium; fall back to Firefox
-        try:
-            browser = await p.chromium.launch(headless=True, args=launch_args)
-        except Exception as e:
-            print(f"[WARN] Chromium launch failed: {e}")
-            try:
-                browser = await p.firefox.launch(headless=True)
-            except Exception as e2:
-                print(f"[ERROR] Firefox launch failed: {e2}")
-                # No browsers—return originals
-                return rows
-
-        ctx = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            timezone_id=os.environ.get("TZ", "America/Los_Angeles"),
-        )
-
-        sem = asyncio.Semaphore(conc)
-
-        async def one(row: Dict):
-            async with sem:
-                page = await ctx.new_page()
-                try:
-                    await page.goto(row["link"], wait_until="commit", timeout=60_000)
-                    try:
-                        await page.wait_for_load_state("domcontentloaded", timeout=20_000)
-                    except Exception:
-                        pass
-                    brand, title, price, size, condition = await _extract_detail_fields(page)
-                    out.append({
-                        "platform": "Depop",
-                        "brand": brand or row.get("brand", ""),
-                        "item_name": title or row.get("item_name", ""),
-                        "price": price or row.get("price", ""),
-                        "size": size or row.get("size", ""),
-                        "condition": condition or row.get("condition", ""),
-                        "link": row["link"],
-                    })
-                except Exception as e:
-                    print(f"[WARN] detail fetch failed for {row.get('link')}: {e}")
-                    out.append(row.copy())
-                finally:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                # polite random delay to avoid hammering
-                await asyncio.sleep(random.uniform(delay_min/1000, delay_max/1000))
-
-        await asyncio.gather(*(one(r) for r in targets))
-
-        try:
-            await ctx.close()
-            await browser.close()
-        except Exception:
-            pass
-
-    # Preserve order by original rows
-    by_link = {r["link"]: r for r in out}
-    merged = []
-    for r in rows:
-        merged.append(by_link.get(r["link"], r))
-    return merged
-
-
-async def _extract_detail_fields(page) -> Tuple[str, str, str, str, str]:
-    """
-    Extract brand, title, price, size, condition from a product detail page.
-    Uses resilient selector list + regex fallbacks.
-    """
-    js = r"""
-    () => {
-      const pick = (arr) => {
-        for (const sel of arr) {
-          const el = document.querySelector(sel);
-          if (el) return (el.textContent || "").trim();
-        }
-        return "";
-      };
-      const title = pick([
-        "[data-testid='product-title']",
-        "h1", "h2"
-      ]);
-      const brand = pick([
-        "[data-testid='brand']",
-        "a[href*='/brand/']",
-        "span[class*='brand']",
-        "a[aria-label*='Brand']"
-      ]);
-      let price = pick([
-        "[data-testid='price']",
-        "[itemprop='price']",
-        "span[aria-label*='Price']",
-        "div[aria-label*='Price']",
-        "span[class*='Price']",
-        "p[class*='Price']"
-      ]);
-      if (!price) {
-        const m = (document.body.innerText || "").match(/[£$€]\s?\d+[.,]?\d*/);
-        if (m) price = m[0];
-      }
-      // Size/Condition (try common label/value pairs)
-      let size = "";
-      let condition = "";
-
-      const text = (n) => (n && (n.textContent || "").trim()) || "";
-
-      // look for definition lists
-      const dts = Array.from(document.querySelectorAll("dt, div, span, p"));
-      for (const el of dts) {
-        const t = text(el).toLowerCase();
-        if (!size && t.includes("size")) {
-          // sibling or next element
-          const sib = el.nextElementSibling;
-          if (sib) { size = text(sib); }
-        }
-        if (!condition && t.includes("condition")) {
-          const sib = el.nextElementSibling;
-          if (sib) { condition = text(sib); }
-        }
-      }
-
-      // Clean title if it has separators (avoid seller mix-ins)
-      let cleanTitle = title;
-      if (cleanTitle && (cleanTitle.includes("•") || cleanTitle.includes("|"))) {
-        const parts = cleanTitle.split(/•|\|/).map(s => s.trim()).filter(Boolean);
-        if (parts.length) parts.sort((a,b) => b.length - a.length), cleanTitle = parts[0];
-      }
-
-      return { brand, title: cleanTitle, price, size, condition };
-    }
-    """
-    try:
-        data = await page.evaluate(js)
-        return (
-            data.get("brand", "") or "",
-            data.get("title", "") or "",
-            data.get("price", "") or "",
-            data.get("size", "") or "",
-            data.get("condition", "") or "",
-        )
-    except Exception:
-        return ("", "", "", "", "")

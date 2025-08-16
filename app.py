@@ -2,6 +2,7 @@ import os, io, csv, time
 from typing import List, Dict
 import streamlit as st
 from pandas import DataFrame
+import asyncio
 
 # --- Page setup
 st.set_page_config(page_title="Depop Scraper", page_icon="🎢", layout="wide")
@@ -32,9 +33,9 @@ def render_header():
         <div class="subheader">Search Depop listings and export to Google Sheets</div>
     """, unsafe_allow_html=True)
 
+# --- UI Panels and Display
 def render_search_controls():
     st.markdown("#### 🔍 Search Configuration")
-    st.markdown('<div class="search-controls">', unsafe_allow_html=True)
     col1, col2, col3 = st.columns([3, 1.2, 1.5], vertical_alignment="bottom")
 
     with col1:
@@ -45,7 +46,6 @@ def render_search_controls():
         )
 
     with col2:
-        st.markdown('<div style="margin-bottom: 8px;"></div>', unsafe_allow_html=True)
         st.session_state.deep = st.toggle(
             "🔬 Deep Fetch",
             value=st.session_state.get("deep", True),
@@ -53,10 +53,7 @@ def render_search_controls():
         )
 
     with col3:
-        st.markdown('<div style="margin-bottom: 8px;"></div>', unsafe_allow_html=True)
         st.session_state.run = st.button("🚀 Start Scraping", use_container_width=True, type="primary")
-
-    st.markdown('</div>', unsafe_allow_html=True)
 
 def render_info_section():
     tab1, tab2 = st.tabs(["📋 Setup Guide", "🔧 System Status"])
@@ -69,10 +66,10 @@ def render_info_section():
 
         with col1:
             st.write("**Environment**")
-            st.info("✅ Playwright: Auto-installed" if True else "❌ Playwright: Missing")
+            st.info("✅ Playwright: Auto-installed")
             st.info("✅ Local credentials.json found" if os.path.exists("credentials.json") else "ℹ️ Using cloud credentials")
 
-            # Creds status (only shown here, not in header)
+            # 🔐 Creds status only here (and hidden on Cloud)
             IS_CLOUD = bool(os.environ.get("STREAMLIT_RUNTIME"))
             if not IS_CLOUD:
                 if st.session_state.get("secrets_ok"):
@@ -81,9 +78,6 @@ def render_info_section():
                     st.info("🔐 Using local credentials.json")
                 else:
                     st.error("🔴 No Credentials Found")
-            else:
-                # On cloud, keep this hidden/noise-free unless needed
-                pass
 
         with col2:
             st.write("**Module Status**")
@@ -102,7 +96,6 @@ def render_info_section():
 def render_results(rows: List[Dict], sheet_name: str):
     st.markdown("#### 📊 Results")
 
-    # Metrics
     st.markdown(f"""
     <div class="metric-grid">
         <div class="metric-card">
@@ -120,7 +113,6 @@ def render_results(rows: List[Dict], sheet_name: str):
     </div>
     """, unsafe_allow_html=True)
 
-    # Tabs for different views
     tab1, tab2, tab3 = st.tabs(["📄 Data Table", "💾 Download", "📝 Activity Log"])
 
     with tab1:
@@ -191,14 +183,6 @@ with st.sidebar:
         DEEP_FETCH_CONCURRENCY = st.slider("Concurrent requests", 1, 6, 3)
         DEEP_FETCH_DELAY_MIN, DEEP_FETCH_DELAY_MAX = st.slider("Request delay (ms)", 200, 4000, (800, 1600))
 
-        # NEW: run without Playwright using requests/HTML parsing
-        USE_REQUESTS_FALLBACK = st.toggle(
-            "Use HTTP fallback (no browser)",
-            value=True,
-            help="If headless browser can’t launch in the cloud, scrape via requests + HTML parsing."
-        )
-
-    with st.expander("🔧 Advanced Options"):
         MAX_ROUNDS = st.number_input("Max scroll rounds", min_value=10, max_value=2000, value=400, step=10)
         WARMUP_ROUNDS = st.number_input("Warmup rounds", min_value=0, max_value=100, value=6, step=1)
         IDLE_ROUNDS = st.number_input("Stop after N idle rounds", min_value=2, max_value=30, value=6, step=1)
@@ -208,12 +192,8 @@ with st.sidebar:
 
 # --- Main Application Layout
 render_header()
-
-with st.container(border=True):
-    render_search_controls()
-
-with st.container(border=True):
-    render_info_section()
+render_search_controls()
+render_info_section()
 
 # --- Google Sheets Authentication
 gc = None
@@ -227,14 +207,40 @@ if authorize_gspread:
         st.session_state["local_creds_ok"] = False
         st.info(f"💡 Google Sheets integration not available: {e}")
 
-# --- Run Scraping Process
+# -------------------- RUN SCRAPING PROCESS (sync + async safe) --------------------
+
+# Bounded log helper (prevents memory blowups)
+MAX_LOG_LINES = 400
+def log(msg: str):
+    ts = time.strftime("%H:%M:%S")
+    logs = st.session_state.get("logs", [])
+    logs.append(f"{ts} - {msg}")
+    if len(logs) > MAX_LOG_LINES:
+        logs = logs[-MAX_LOG_LINES:]
+    st.session_state["logs"] = logs
+
+def run_scraper_safe(query: str, deep: bool, limits: dict):
+    """
+    Calls scrape_depop whether it's sync or async.
+    Works even if a loop is already running (e.g., some Streamlit setups).
+    """
+    result = scrape_depop(query, deep=deep, limits=limits)
+    if asyncio.iscoroutine(result):
+        try:
+            return asyncio.run(result)
+        except RuntimeError:
+            # If there's already a running event loop, use a dedicated one.
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(result)
+            finally:
+                loop.close()
+    return result
+
 if st.session_state.get("run"):
-    st.session_state.logs = []
+    st.session_state["logs"] = []  # reset each run
 
-    def log(msg: str):
-        st.session_state.logs.append(f"{time.strftime('%H:%M:%S')} - {msg}")
-
-    # Prepare configuration (NOW includes HTTP fallback flag)
+    # Prepare configuration
     limits = dict(
         MAX_ITEMS=int(MAX_ITEMS),
         MAX_DURATION_S=int(MAX_DURATION_S),
@@ -249,12 +255,9 @@ if st.session_state.get("run"):
         NETWORK_IDLE_TIMEOUT=int(NETWORK_IDLE_TIMEOUT),
         PAUSE_MIN=int(PAUSE_MIN),
         PAUSE_MAX=int(PAUSE_MAX),
-
-        # NEW: enable pure-HTTP scraping when Playwright/browsers aren’t present
-        USE_REQUESTS_FALLBACK=bool(USE_REQUESTS_FALLBACK),
     )
 
-    rows: List[Dict] = []
+    rows: List[Dict] = []  # always define
 
     if scrape_depop is None:
         log("Scraper module not available - generating sample data")
@@ -265,21 +268,27 @@ if st.session_state.get("run"):
             "price": "$199",
             "size": "L",
             "condition": "Good condition",
-            "link": f"https://www.depop.com/search/?q={st.session_state.query.replace(' ','%20')}"
+            "link": f"https://www.depop.com/search/?q={st.session_state.query.replace(' ','%20')}",
         }]
     else:
         with st.spinner(f"🔍 Scraping Depop for '{st.session_state.query}'..."):
             log(f"Starting scrape for '{st.session_state.query}' (max {MAX_ITEMS} items, deep fetch: {st.session_state.deep})")
-            start_time = time.time()
-
+            t0 = time.time()
             try:
-                rows = scrape_depop(st.session_state.query, deep=st.session_state.deep, limits=limits)
+                result = run_scraper_safe(
+                    st.session_state.query,
+                    deep=st.session_state.deep,
+                    limits=limits,
+                )
+                rows = result if isinstance(result, list) else []
+                if not rows:
+                    log("⚠️ Scraper returned no rows (None or unexpected type).")
             except Exception as e:
+                rows = []
                 log(f"❌ Scraping failed: {e}")
                 st.error(f"Scraping failed: {e}")
-
-            duration = time.time() - start_time
-            log(f"✅ Scraping completed in {duration:.1f}s — raw rows: {len(rows)}")
+            dur = time.time() - t0
+            log(f"✅ Scraping completed in {dur:.1f}s - found {len(rows)} items")
 
     # Save to Google Sheets
     if gc and rows:
@@ -321,14 +330,12 @@ if st.session_state.get("run"):
                     row.get("link", ""),
                 ] for row in rows]
 
-                # Insert in batches
                 BATCH_SIZE = 300
-                total_batches = (len(data_rows) + BATCH_SIZE - 1) // BATCH_SIZE
+                total_batches = max(1, (len(data_rows) + BATCH_SIZE - 1) // BATCH_SIZE)
                 for i in range(0, len(data_rows), BATCH_SIZE):
                     batch = data_rows[i:i + BATCH_SIZE]
                     worksheet.append_rows(batch, value_input_option="RAW")
-                    batch_num = i // BATCH_SIZE + 1
-                    log(f"Uploaded batch {batch_num}/{total_batches}")
+                    log(f"Uploaded batch {i // BATCH_SIZE + 1}/{total_batches}")
 
                 st.success(f"✅ Successfully saved {len(rows)} items to **{SHEET_NAME} / {tab_title}**")
                 log(f"✅ Data saved to Google Sheets: {SHEET_NAME} / {tab_title}")
@@ -341,4 +348,4 @@ if st.session_state.get("run"):
     if rows:
         render_results(rows, SHEET_NAME)
     else:
-        st.info("No results to display. Try adjusting your search terms or settings.")
+        st.info("No data to display. Try adjusting your search terms or settings.")
